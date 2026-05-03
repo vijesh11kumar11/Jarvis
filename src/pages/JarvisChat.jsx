@@ -147,15 +147,16 @@ export default function JarvisChat() {
 
     // ── CONFIRMING path: we're waiting for yes / no ──
     if (confirmingRef.current && pendingRef.current) {
-      confirmingRef.current = false;
       const tl   = text.toLowerCase();
       const yes  = /(yes|yeah|sure|go|do it|please|haan|seri|sari|ok|okay)/.test(tl);
       const no   = /(no|nope|cancel|stop|skip|wait|don't|illa|venda)/.test(tl);
       if (yes || no) {
+        confirmingRef.current = false;        // clear only on valid yes/no
         setStatus(S.THINKING);
         try {
-          const r = await api.confirmAction(pendingRef.current.action_id, yes);
-          pendingRef.current = null;
+          const actionId = pendingRef.current.action_id;
+          const r = await api.confirmAction(actionId, yes);
+          pendingRef.current = null;           // clear only after confirmAction completes
           const reply = yes
             ? `Done. ${r?.result || "Action completed."}`.slice(0, 240)
             : "Got it, cancelled that.";
@@ -166,6 +167,7 @@ export default function JarvisChat() {
           await speak("Hmm, something went wrong with that action.");
         }
       } else {
+        // Stay in confirming mode — confirmingRef remains true
         await speak("Just say yes or no — should I go ahead?", true);
       }
       return;
@@ -176,18 +178,22 @@ export default function JarvisChat() {
     let gotReply = false;
     await api.chat(text, {
       onDelta: () => {},
-      onDone: async (full) => {
+      onDone: async (full, obj) => {
         gotReply = true;
         dispatch({ type: "lastAssist", payload: full });
         dispatch({ type: "pushMsg",    payload: { role: "assistant", text: full } });
 
         if (api.pendingAction) {
+          // Confirmation needed (send_whatsapp / send_email etc.)
           pendingRef.current    = api.pendingAction;
           confirmingRef.current = true;
           const q = api.pendingAction.speak ||
             "I'd like to take an action for you — say yes to confirm or no to cancel.";
-          // speak the question, then auto-start listening for yes/no
           await speak(q, true);
+        } else if (obj?.action_executed) {
+          // Auto-executed action (open_website / screenshot etc.) — just speak confirmation
+          const spokenText = obj.action_executed.speak || full;
+          await speak(spokenText);
         } else {
           await speak(full);
         }

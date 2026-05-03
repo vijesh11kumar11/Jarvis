@@ -303,7 +303,43 @@ async def chat(req: ChatRequest):
             if conv_id and text:
                 await db.add_message(conv_id, "assistant", text,
                                      model_used=req.use_model or "auto")
-            yield f"data: {json.dumps({'done': True, 'conversation_id': conv_id, 'mode': current_mode})}\n\n"
+
+            # ── Detect JSON action block in response ──────────────────────
+            import re as _re, uuid as _uuid
+            done_payload: dict = {"done": True, "conversation_id": conv_id,
+                                  "mode": current_mode}
+            _NO_CONFIRM = {"open_website", "open_app", "screenshot", "search_web"}
+            _action_m = _re.search(r'\{[^{}]*"action"\s*:[^{}]*\}', text, _re.DOTALL)
+            if _action_m:
+                try:
+                    _aj = json.loads(_action_m.group())
+                    _act = _aj.get("action", "")
+                    _speak = _aj.get("speak", "")
+                    _params = {k: v for k, v in _aj.items()
+                               if k not in ("action", "speak")}
+                    if _act in _NO_CONFIRM:
+                        _res = await cc.execute(_act, _params, router=router)
+                        done_payload["action_executed"] = {
+                            "action": _act, "result": _res, "speak": _speak}
+                        done_payload["speak"] = _speak
+                        if req.user_id:
+                            await db.log_computer_action(
+                                req.user_id, _act, _params,
+                                _res.get("success", False),
+                                str(_res.get("result", ""))[:500])
+                    elif _act:
+                        _aid = str(_uuid.uuid4())
+                        _pending_actions[_aid] = {
+                            "action": _act, "params": _params,
+                            "user_id": req.user_id, "speak": _speak}
+                        done_payload["requires_confirmation"] = True
+                        done_payload["action_id"] = _aid
+                        done_payload["action"] = _act
+                        done_payload["speak"] = _speak
+                except Exception:
+                    pass  # not valid JSON — treat as plain conversation
+
+            yield f"data: {json.dumps(done_payload)}\n\n"
             if user_id != "anonymous" and text:
                 asyncio.create_task(
                     mem.extract_memories_from_conversation(user_id, user_msg, text))

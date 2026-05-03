@@ -47,6 +47,7 @@ export function useJarvisAPI({
             if (obj.done) {
               conversationIdRef.current = obj.conversation_id || conversationIdRef.current;
               if (obj.mode) setMode(obj.mode);
+              if (obj.requires_confirmation) setPendingAction(obj);
               onDone?.(full, obj);
             }
             if (obj.error) onError?.(obj.error);
