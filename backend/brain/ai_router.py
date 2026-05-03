@@ -153,7 +153,7 @@ class AIRouter:
             return resp.text or ""
         except Exception as e:
             print(f"[ai_router] simple_gemini error: {e}")
-            return ""
+            raise  # re-raise so callers can fall back to DeepSeek/Groq
 
     async def simple_groq(self, prompt: str, model: Optional[str] = None) -> str:
         if not self.async_groq:
@@ -319,7 +319,10 @@ class AIRouter:
                               model: str = "deepseek-chat") -> str:
         key = os.getenv("DEEPSEEK_API_KEY")
         if not key:
-            return ""
+            raise RuntimeError("DEEPSEEK_API_KEY not set")
+        # DeepSeek context window ~64k tokens; chars are ~4:1, so cap at 60k chars
+        if len(prompt) > 60_000:
+            prompt = prompt[:60_000] + "\n[...truncated for length...]"
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 r = await client.post(
@@ -331,10 +334,13 @@ class AIRouter:
                           "max_tokens": 2048, "temperature": 0.6},
                 )
                 j = r.json()
+                if "choices" not in j:
+                    err = j.get("error", j)
+                    raise RuntimeError(f"DeepSeek API error: {err}")
                 return j["choices"][0]["message"]["content"]
         except Exception as e:
             print(f"[ai_router] simple_deepseek error: {e}")
-            return ""
+            raise  # re-raise so callers can see the real error
 router_instance: Optional[AIRouter] = None
 
 def get_router() -> AIRouter:

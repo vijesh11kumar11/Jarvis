@@ -169,13 +169,20 @@ async def analyze_repo_for_marketing(url_or_owner_repo: str,
         topics=", ".join(data["topics"]) or "—",
         langs=", ".join(data["languages"]) or "—",
         files=", ".join(data["files_root"]) or "—",
-        readme=(data["readme"] or "(no README)")[:14000],
+        readme=(data["readme"] or "(no README)")[:6000],
         deps=deps or "—",
     )
-    try:
-        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash")
-    except Exception:
-        analysis = await router.simple_deepseek(prompt)
+    analysis = ""
+    for _call in (
+        lambda: router.simple_gemini(prompt, model="gemini-2.0-flash"),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            analysis = await _call()
+            if analysis: break
+        except Exception:
+            continue
     spoken = ""
     m = re.search(r"SPOKEN BRIEF:\s*(.+)", analysis, re.IGNORECASE | re.DOTALL)
     if m: spoken = m.group(1).strip()[:800]

@@ -146,12 +146,19 @@ async def analyze_document_for_marketing(file_bytes: bytes, filename: str,
     biz = json.dumps(user_context or {}, default=str)[:1200]
     prompt = ANALYSIS_TEMPLATE.format(
         user_name=user_name, doc_type=doc_type, biz=biz,
-        friend=friend_context[:1200], content=text[:18000],
+        friend=friend_context[:1200], content=text[:8000],
     )
-    try:
-        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash")
-    except Exception:
-        analysis = await router.simple_deepseek(prompt)
+    analysis = ""
+    for _call in (
+        lambda: router.simple_gemini(prompt, model="gemini-2.0-flash"),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            analysis = await _call()
+            if analysis: break
+        except Exception:
+            continue
     spoken = ""
     m = re.search(r"SPOKEN BRIEF:\s*(.+)", analysis, re.IGNORECASE | re.DOTALL)
     if m: spoken = m.group(1).strip()[:600]
