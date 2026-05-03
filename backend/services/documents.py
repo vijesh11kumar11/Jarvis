@@ -149,7 +149,7 @@ async def analyze_document_for_marketing(file_bytes: bytes, filename: str,
         friend=friend_context[:1200], content=text[:18000],
     )
     try:
-        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash")
     except Exception:
         analysis = await router.simple_deepseek(prompt)
     spoken = ""

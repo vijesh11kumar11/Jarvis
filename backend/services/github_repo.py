@@ -173,7 +173,7 @@ async def analyze_repo_for_marketing(url_or_owner_repo: str,
         deps=deps or "—",
     )
     try:
-        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash")
     except Exception:
         analysis = await router.simple_deepseek(prompt)
     spoken = ""

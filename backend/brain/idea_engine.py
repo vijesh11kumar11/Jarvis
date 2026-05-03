@@ -63,7 +63,7 @@ Return ONLY valid JSON in this exact shape:
 ]}}"""
         raw = ""
         try:
-            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash")
         except Exception:
             try:
                 raw = await self.ai.simple_deepseek(prompt)
@@ -83,7 +83,7 @@ Return ONLY valid JSON:
   "fix_if_yellow":"<1 sentence or empty>",
   "spoken_verdict":"<friend-style 25-35 word verbal opinion>"}}"""
         try:
-            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash")
         except Exception:
             raw = await self.ai.simple_deepseek(prompt)
         return _safe_json(raw) or {"verdict": "YELLOW", "why": "Couldn't evaluate.",
@@ -99,7 +99,7 @@ Return ONLY valid JSON in the same shape as a single idea (with name, tagline,
 the_insight, execution[], what_makes_it_different, success_metric,
 time_to_first_results, spoken_pitch)."""
         try:
-            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+            raw = await self.ai.simple_gemini(prompt, model="gemini-2.0-flash")
         except Exception:
             raw = await self.ai.simple_deepseek(prompt)
         parsed = _safe_json(raw)

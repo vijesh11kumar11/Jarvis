@@ -69,7 +69,7 @@ async def _synth(prompt: str, max_words: int = 90) -> str:
         f"{prompt}"
     )
     try:
-        return (await router.simple_gemini(full, model="gemini-2.0-flash-exp")).strip()
+        return (await router.simple_gemini(full, model="gemini-2.0-flash")).strip()
     except Exception:
         try:
             return (await router.simple_deepseek(full)).strip()

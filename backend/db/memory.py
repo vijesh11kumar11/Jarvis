@@ -126,7 +126,7 @@ async def extract_memories_from_conversation(user_id: str,
         assistant_msg=(assistant_message or "")[:1500],
     )
     try:
-        raw = await router.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+        raw = await router.simple_gemini(prompt, model="gemini-2.0-flash")
     except Exception:
         try:
             raw = await router.simple_deepseek(prompt)

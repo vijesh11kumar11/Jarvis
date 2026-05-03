@@ -79,7 +79,7 @@ def test_keys():
         try:
             import google.generativeai as gen
             gen.configure(api_key=g)
-            m = gen.GenerativeModel("gemini-2.0-flash-exp")
+            m = gen.GenerativeModel("gemini-2.0-flash")
             m.generate_content("ping")
             ok("Gemini key works")
         except Exception as e:

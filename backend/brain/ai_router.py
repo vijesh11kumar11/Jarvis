@@ -49,8 +49,8 @@ DEEP_KEYWORDS = ["analyze code", "review code", "audit", "deep analysis",
 
 
 class AIRouter:
-    GEMINI_MODEL = "gemini-2.0-flash-exp"
-    GEMINI_VISION = "gemini-1.5-pro"
+    GEMINI_MODEL = "gemini-2.0-flash"
+    GEMINI_VISION = "gemini-1.5-pro-latest"
     GROQ_MODEL = "llama-3.3-70b-versatile"
 
     def __init__(self):
@@ -123,12 +123,25 @@ class AIRouter:
         except Exception as e:
             yield f"[Gemini error: {e}]"
 
+    # Maps any retired/preview model names to their current equivalents
+    _MODEL_REMAP = {
+        "gemini-2.0-flash-exp":  "gemini-2.0-flash",
+        "gemini-1.5-pro":        "gemini-1.5-pro-latest",
+        "gemini-pro":            "gemini-1.5-pro-latest",
+    }
+
+    def _remap_model(self, model: Optional[str]) -> str:
+        if not model:
+            return self.GEMINI_MODEL
+        return self._MODEL_REMAP.get(model, model)
+
     async def simple_gemini(self, prompt: str, model: Optional[str] = None) -> str:
+        resolved = self._remap_model(model)
         target = self.gemini
-        if model and model != getattr(self, 'GEMINI_MODEL', None):
+        if resolved != self.GEMINI_MODEL:
             try:
                 import google.generativeai as genai
-                target = genai.GenerativeModel(model)
+                target = genai.GenerativeModel(resolved)
             except Exception:
                 target = self.gemini
         if not target:
