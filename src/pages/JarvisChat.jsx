@@ -3,8 +3,17 @@
  * Startup sequence → idle → wake → listen → think → speak → idle.
  * Tap-to-talk + push-to-hold + auto wake-word + double-clap.
  * Avatar + Orb both react to amplitude.
+ *
+ * BUGS FIXED:
+ *  1. Stale closures — all volatile state referenced inside async funcs
+ *     goes through refs, not the reducer snapshot.
+ *  2. CONFIRMING flow — confirmingRef short-circuits endListeningAndProcess
+ *     into a yes/no path instead of a normal chat round.
+ *  3. Transcript accumulation — uses functional dispatch reducer so
+ *     consecutive dispatches never clobber each other.
+ *  4. Wake-word SSE — reads statusRef so it never acts on stale status.
  */
-import React, { useEffect, useReducer, useRef, useState } from "react";
+import React, { useEffect, useReducer, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import Orb from "../components/Orb.jsx";
 import Avatar from "../components/Avatar.jsx";
@@ -13,67 +22,73 @@ import { useVoice } from "../hooks/useVoice.js";
 import { useJarvisAPI } from "../hooks/useJarvis.js";
 import { useJarvis } from "../context/JarvisContext.jsx";
 
-const STATES = {
-  STARTUP: "STARTUP",
-  IDLE: "IDLE",
-  WAKE_DETECTED: "WAKE_DETECTED",
-  LISTENING: "LISTENING",
+const S = {
+  STARTUP:    "STARTUP",
+  IDLE:       "IDLE",
+  LISTENING:  "LISTENING",
   PROCESSING: "PROCESSING",
-  THINKING: "THINKING",
-  SPEAKING: "SPEAKING",
+  THINKING:   "THINKING",
+  SPEAKING:   "SPEAKING",
   CONFIRMING: "CONFIRMING",
-  ERROR: "ERROR",
+  ERROR:      "ERROR",
 };
 
 function reducer(state, action) {
   switch (action.type) {
-    case "set":      return { ...state, ...action.payload };
-    case "transcript": return { ...state, lastUser: action.payload };
-    case "reply":    return { ...state, lastAssistant: action.payload };
-    case "status":   return { ...state, status: action.payload };
-    default:         return state;
+    case "status":     return { ...state, status: action.payload };
+    case "followUp":   return { ...state, followUp: action.payload };
+    case "pushMsg":    return { ...state,
+                         transcript: [...state.transcript, action.payload].slice(-30) };
+    case "lastUser":   return { ...state, lastUser: action.payload };
+    case "lastAssist": return { ...state, lastAssistant: action.payload };
+    default:           return state;
   }
 }
-
-const initial = {
-  status: STATES.STARTUP,
-  lastUser: "",
-  lastAssistant: "",
-  transcript: [],   // { role, text } []
-  followUp: false,
-  showAvatar: localStorage.getItem("jarvis_show_avatar") !== "false",
-};
 
 export default function JarvisChat() {
   const { profile } = useJarvis();
   const userId = profile?.userId || "anonymous";
-  const [s, dispatch] = useReducer(reducer, initial);
-  const setStatus = (status) => dispatch({ type: "status", payload: status });
 
-  const voice = useVoice();
-  const api = useJarvisAPI({
-    userId,
-    jarvisName: profile.jarvisName,
-    userName: profile.userName,
+  const [s, dispatch] = useReducer(reducer, {
+    status:         S.STARTUP,
+    lastUser:       "",
+    lastAssistant:  "",
+    transcript:     [],
+    followUp:       false,
+    showAvatar:     localStorage.getItem("jarvis_show_avatar") !== "false",
   });
 
-  const wakeSrcRef = useRef(null);
-  const briefingPlayedRef = useRef(false);
+  // ── Refs so async funcs always see current values ──
+  const statusRef     = useRef(S.STARTUP);
+  const followUpRef   = useRef(false);
+  const confirmingRef = useRef(false);   // true while we wait for yes/no
+  const pendingRef    = useRef(null);    // holds api.pendingAction during confirmation
+  const briefedRef    = useRef(false);
 
-  // ── Startup sequence ──
+  const setStatus = (st) => {
+    statusRef.current = st;
+    dispatch({ type: "status", payload: st });
+  };
+
+  const voice = useVoice();
+  const api   = useJarvisAPI({ userId,
+    jarvisName: profile.jarvisName,
+    userName:   profile.userName });
+
+  // ── Startup ──
   useEffect(() => {
-    const t1 = setTimeout(() => setStatus(STATES.IDLE), 2500);
-    return () => clearTimeout(t1);
+    const t = setTimeout(() => setStatus(S.IDLE), 2500);
+    return () => clearTimeout(t);
   }, []);
 
-  // ── Morning briefing once after first IDLE (if today not greeted) ──
+  // ── Morning briefing — fires once when first IDLE ──
   useEffect(() => {
-    if (s.status !== STATES.IDLE || briefingPlayedRef.current) return;
-    briefingPlayedRef.current = true;
+    if (s.status !== S.IDLE || briefedRef.current) return;
+    briefedRef.current = true;
     (async () => {
       try {
         if (userId === "anonymous") {
-          await speak(`Hey ${profile.userName}, I'm ${profile.jarvisName}. Tap the orb or say "hey jarvis" whenever you want to talk.`);
+          await speak(`Hey ${profile.userName}, I'm ${profile.jarvisName}. Tap the orb whenever you want to talk.`);
           return;
         }
         const brief = await api.triggerMorningBriefing();
@@ -83,144 +98,140 @@ export default function JarvisChat() {
     // eslint-disable-next-line
   }, [s.status]);
 
-  // ── Wake-word SSE ──
+  // ── Wake-word SSE (reads statusRef — never stale) ──
   useEffect(() => {
-    let sse;
-    try {
-      // best-effort: enable wake listeners on backend
-      fetch("http://localhost:8000/wake-word/start", { method: "POST" })
-        .catch(() => {});
-      sse = new EventSource("http://localhost:8000/wake-word/events");
-      sse.onmessage = (ev) => {
-        try {
-          const data = JSON.parse(ev.data || "{}");
-          wakeSrcRef.current = data.source || "any";
-          if (s.status === STATES.IDLE || s.status === STATES.SPEAKING) {
-            handleWake();
-          }
-        } catch {}
-      };
-    } catch {}
-    return () => { try { sse?.close(); } catch {} };
+    fetch("http://localhost:8000/wake-word/start", { method: "POST" }).catch(() => {});
+    const sse = new EventSource("http://localhost:8000/wake-word/events");
+    sse.onmessage = () => {
+      const st = statusRef.current;
+      if (st === S.IDLE || st === S.SPEAKING) {
+        if (voice.playing) voice.stopPlaying();
+        beginListening();
+      }
+    };
+    sse.onerror = () => {};
+    return () => sse.close();
     // eslint-disable-next-line
-  }, [s.status]);
+  }, []);  // mount-only; reads refs not state
 
-  // ── Core action: speak then return to IDLE (or LISTENING if follow-up) ──
-  async function speak(text) {
-    if (!text) return;
-    setStatus(STATES.SPEAKING);
+  // ── Core: speak text, then auto-listen or go idle ──
+  async function speak(text, thenListen = false) {
+    if (!text) { setStatus(S.IDLE); return; }
+    setStatus(S.SPEAKING);
     await new Promise((resolve) => {
       voice.playAudio(text, profile?.voiceId, () => {
-        if (s.followUp) setTimeout(() => beginListening(), 300);
-        else setStatus(STATES.IDLE);
+        if (thenListen || followUpRef.current) {
+          beginListening();
+        } else {
+          setStatus(S.IDLE);
+        }
         resolve();
       });
     });
   }
 
   async function beginListening() {
-    setStatus(STATES.LISTENING);
+    setStatus(S.LISTENING);
     await voice.startListening();
   }
 
-  async function handleWake() {
-    if (voice.playing) voice.stopPlaying();
-    await beginListening();
-  }
-
+  // ── Main pipeline: stop mic → transcribe → chat → speak ──
   async function endListeningAndProcess() {
-    setStatus(STATES.PROCESSING);
+    setStatus(S.PROCESSING);
     const result = await voice.stopListening();
-    const text = (result?.text || "").trim();
-    if (!text) {
-      setStatus(STATES.IDLE);
+    const text   = (result?.text || "").trim();
+    if (!text) { setStatus(S.IDLE); return; }
+
+    dispatch({ type: "lastUser",  payload: text });
+    dispatch({ type: "pushMsg",   payload: { role: "user", text } });
+
+    // ── CONFIRMING path: we're waiting for yes / no ──
+    if (confirmingRef.current && pendingRef.current) {
+      confirmingRef.current = false;
+      const tl   = text.toLowerCase();
+      const yes  = /(yes|yeah|sure|go|do it|please|haan|seri|sari|ok|okay)/.test(tl);
+      const no   = /(no|nope|cancel|stop|skip|wait|don't|illa|venda)/.test(tl);
+      if (yes || no) {
+        setStatus(S.THINKING);
+        try {
+          const r = await api.confirmAction(pendingRef.current.action_id, yes);
+          pendingRef.current = null;
+          const reply = yes
+            ? `Done. ${r?.result || "Action completed."}`.slice(0, 240)
+            : "Got it, cancelled that.";
+          dispatch({ type: "pushMsg",    payload: { role: "assistant", text: reply } });
+          dispatch({ type: "lastAssist", payload: reply });
+          await speak(reply);
+        } catch (e) {
+          await speak("Hmm, something went wrong with that action.");
+        }
+      } else {
+        await speak("Just say yes or no — should I go ahead?", true);
+      }
       return;
     }
-    dispatch({ type: "transcript", payload: text });
-    dispatch({ type: "set", payload: { transcript: [...s.transcript, { role: "user", text }] } });
 
-    setStatus(STATES.THINKING);
-    let acc = "";
+    // ── Normal chat path ──
+    setStatus(S.THINKING);
+    let gotReply = false;
     await api.chat(text, {
-      onDelta: (_d, full) => { acc = full; },
+      onDelta: () => {},
       onDone: async (full) => {
-        dispatch({ type: "reply", payload: full });
-        dispatch({ type: "set", payload: {
-          transcript: [...s.transcript, { role: "user", text },
-                                       { role: "assistant", text: full }],
-        }});
+        gotReply = true;
+        dispatch({ type: "lastAssist", payload: full });
+        dispatch({ type: "pushMsg",    payload: { role: "assistant", text: full } });
+
         if (api.pendingAction) {
-          setStatus(STATES.CONFIRMING);
-          await speak(api.pendingAction.speak ||
-            "I want to take an action. Should I go ahead? Say yes or no.");
+          pendingRef.current    = api.pendingAction;
+          confirmingRef.current = true;
+          const q = api.pendingAction.speak ||
+            "I'd like to take an action for you — say yes to confirm or no to cancel.";
+          // speak the question, then auto-start listening for yes/no
+          await speak(q, true);
         } else {
           await speak(full);
         }
       },
       onError: async (err) => {
-        await speak(`Hmm, something broke: ${err}`);
+        gotReply = true;
+        await speak(`Something broke: ${err}`);
       },
     });
-    if (!acc) setStatus(STATES.IDLE);
+    if (!gotReply) setStatus(S.IDLE);
   }
 
-  // ── Tap orb to toggle listening ──
+  // ── Tap orb ──
   async function onOrbTap() {
-    if (s.status === STATES.LISTENING) {
+    const st = statusRef.current;
+    if (st === S.LISTENING) {
       await endListeningAndProcess();
-    } else if (s.status === STATES.IDLE || s.status === STATES.SPEAKING) {
+    } else if (st === S.IDLE || st === S.SPEAKING) {
       if (voice.playing) voice.stopPlaying();
       await beginListening();
     }
   }
 
-  // ── Hold orb 2s to toggle follow-up mode ──
-  const holdTimerRef = useRef(null);
+  // ── Hold orb 2 s → toggle follow-up (conversation) mode ──
+  const holdRef = useRef(null);
   const onOrbDown = () => {
-    holdTimerRef.current = setTimeout(() => {
-      const next = !s.followUp;
-      dispatch({ type: "set", payload: { followUp: next } });
-      voice.playAudio(next ? "Follow-up mode on. Let's keep talking."
-                           : "Follow-up off.");
+    holdRef.current = setTimeout(() => {
+      const next = !followUpRef.current;
+      followUpRef.current = next;
+      dispatch({ type: "followUp", payload: next });
+      voice.playAudio(next
+        ? "Follow-up mode on — I'll keep listening after each reply."
+        : "Follow-up mode off.");
     }, 2000);
   };
-  const onOrbUp = () => clearTimeout(holdTimerRef.current);
-
-  // ── CONFIRMING handlers (yes/no via voice) ──
-  useEffect(() => {
-    if (s.status !== STATES.CONFIRMING) return;
-    // After speaking the confirmation prompt, listen for yes/no
-    const t = setTimeout(async () => {
-      await beginListening();
-      // Wait for user to stop on their own; reuse pipeline.
-    }, 500);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line
-  }, [s.status]);
-
-  // Detect yes/no out of last user transcript when in CONFIRMING
-  useEffect(() => {
-    if (s.status !== STATES.PROCESSING || !api.pendingAction) return;
-    const t = (s.lastUser || "").toLowerCase();
-    if (!t) return;
-    const yes = /(yes|yeah|sure|go|do it|please|haan|seri|sari)/.test(t);
-    const no  = /(no|nope|cancel|stop|skip|don't|wait)/.test(t);
-    if (yes || no) {
-      api.confirmAction(api.pendingAction.action_id, yes).then(async (r) => {
-        await speak(yes ? `Done. ${r.result || ''}`.slice(0, 240)
-                        : "Okay, cancelled.");
-      });
-    }
-    // eslint-disable-next-line
-  }, [s.lastUser]);
+  const onOrbUp = () => clearTimeout(holdRef.current);
 
   const status = s.status;
   const orbState = (
-    status === STATES.LISTENING ? "listening" :
-    status === STATES.THINKING || status === STATES.PROCESSING ? "thinking" :
-    status === STATES.SPEAKING ? "speaking" :
-    status === STATES.CONFIRMING ? "confirming" :
-    status === STATES.ERROR ? "error" : "idle"
+    status === S.LISTENING  ? "listening" :
+    status === S.THINKING || status === S.PROCESSING ? "thinking" :
+    status === S.SPEAKING   ? "speaking"  :
+    status === S.CONFIRMING ? "confirming" :
+    status === S.ERROR      ? "error" : "idle"
   );
 
   return (
@@ -231,7 +242,7 @@ export default function JarvisChat() {
          }}>
       {/* Startup overlay */}
       <AnimatePresence>
-        {status === STATES.STARTUP && (
+        {status === S.STARTUP && (
           <motion.div
             className="absolute inset-0 bg-black flex items-center justify-center text-violet-300 text-sm tracking-[0.5em]"
             initial={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.6 }}>
@@ -254,12 +265,12 @@ export default function JarvisChat() {
         className="flex flex-col items-center gap-4">
         {s.showAvatar && (
           <Avatar state={orbState} audioAmplitude={voice.amplitude} size={170}
-                  emotion={status === STATES.SPEAKING ? "happy" : "neutral"} />
+                  emotion={status === S.SPEAKING ? "happy" : "neutral"} />
         )}
         <div onClick={onOrbTap}
              onMouseDown={onOrbDown} onMouseUp={onOrbUp}
              onTouchStart={onOrbDown} onTouchEnd={onOrbUp}
-             className="cursor-pointer">
+             className="cursor-pointer select-none">
           <Orb state={orbState}
                audioAmplitude={voice.amplitude}
                audioFrequencies={voice.frequencies}
@@ -267,23 +278,30 @@ export default function JarvisChat() {
                name={profile.jarvisName} />
         </div>
         <div className="text-violet-200/70 text-xs tracking-widest">
-          {status === STATES.IDLE && "TAP THE ORB OR SAY \"HEY JARVIS\""}
-          {status === STATES.LISTENING && "LISTENING — TAP AGAIN TO STOP"}
-          {status === STATES.PROCESSING && "PROCESSING…"}
-          {status === STATES.THINKING && "THINKING…"}
-          {status === STATES.SPEAKING && "SPEAKING…"}
-          {status === STATES.CONFIRMING && "AWAITING CONFIRMATION (SAY YES OR NO)"}
+          {status === S.IDLE       && "TAP THE ORB OR SAY \"HEY JARVIS\""}
+          {status === S.LISTENING  && "LISTENING — TAP AGAIN TO SEND"}
+          {status === S.PROCESSING && "PROCESSING…"}
+          {status === S.THINKING   && "THINKING…"}
+          {status === S.SPEAKING   && "SPEAKING…"}
+          {status === S.CONFIRMING && "SAY YES OR NO"}
         </div>
+        {s.followUp && (
+          <div className="text-emerald-400/70 text-[10px] tracking-widest">
+            ● CONVERSATION MODE — HOLD ORB TO STOP
+          </div>
+        )}
       </motion.div>
 
-      {/* Live transcript pane (small, optional reading) */}
+      {/* Live transcript pane */}
       <motion.div className="absolute bottom-4 left-4 right-4 max-h-44 overflow-auto
                               text-xs font-mono text-white/60 bg-black/40 border border-white/10
                               rounded-lg p-3 pointer-events-none"
         initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 2.5 }}>
-        {s.transcript.slice(-5).map((m, i) => (
+        {s.transcript.slice(-6).map((m, i) => (
           <div key={i} className={m.role === "user" ? "text-emerald-300" : "text-violet-200"}>
-            <span className="opacity-50">{m.role === "user" ? `${profile.userName}:` : `${profile.jarvisName}:`}</span> {m.text}
+            <span className="opacity-50">
+              {m.role === "user" ? `${profile.userName}:` : `${profile.jarvisName}:`}
+            </span>{" "}{m.text}
           </div>
         ))}
       </motion.div>
@@ -298,9 +316,9 @@ export default function JarvisChat() {
         />
       </div>
 
-      {/* End-listening tap-anywhere */}
-      {status === STATES.LISTENING && (
-        <div className="absolute inset-0 cursor-pointer"
+      {/* Tap-anywhere-to-send while listening */}
+      {status === S.LISTENING && (
+        <div className="absolute inset-0 cursor-pointer z-10"
              onClick={endListeningAndProcess} />
       )}
     </div>
