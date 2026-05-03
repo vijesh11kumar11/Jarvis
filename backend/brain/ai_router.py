@@ -251,8 +251,8 @@ class AIRouter:
 
         if produced:
             return
-        # Fallback chain: gemini → deepseek → groq
-        for fb in ["gemini", "deepseek", "groq"]:
+        # Fallback chain: gemini → groq → deepseek
+        for fb in ["gemini", "groq", "deepseek"]:
             if fb == primary:
                 continue
             try:

@@ -289,8 +289,14 @@ async def chat(req: ChatRequest):
     async def streamer():
         full = []
         try:
+            _error_prefixes = ("[gemini error", "[groq error", "[deepseek error")
             async for tok in router.stream_with_fallback(
                     sys_prompt, req.message, history, force_model=req.use_model):
+                # Last-resort guard: never send raw API error tokens to the frontend
+                if tok and tok.lower().lstrip().startswith(_error_prefixes):
+                    continue
+                if tok and ("quota exceeded" in tok.lower() or "429" in tok):
+                    continue
                 full.append(tok)
                 yield f"data: {json.dumps({'delta': tok})}\n\n"
             text = "".join(full).strip()

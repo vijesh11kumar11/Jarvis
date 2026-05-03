@@ -111,10 +111,17 @@ Product: {product}
 Location: {location}
 Business type: {business_type}
 """
-    try:
-        raw = await router.simple_gemini(prompt)
-    except Exception:
-        raw = await router.simple_deepseek(prompt)
+    for _call in (
+        lambda: router.simple_gemini(prompt),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            raw = await _call()
+            if raw:
+                break
+        except Exception:
+            raw = ""
     parsed = {}
     try:
         s = raw.find("{"); e = raw.rfind("}")
@@ -152,10 +159,18 @@ async def get_weekly_market_brief(industry: str, router) -> str:
     prompt = (f"Summarize this week's most important {industry} marketing news in "
               f"a 60-word spoken briefing for a busy founder. Conversational tone, "
               f"no bullets:\n\n{txt}")
-    try:
-        return await router.simple_gemini(prompt) or "No notable industry news this week."
-    except Exception:
-        return await router.simple_deepseek(prompt) or "No notable industry news this week."
+    for _call in (
+        lambda: router.simple_gemini(prompt),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            r = await _call()
+            if r:
+                return r
+        except Exception:
+            pass
+    return "No notable industry news this week."
 
 
 async def competitor_deep_dive(competitor_name: str, location: str, router) -> dict:
@@ -173,10 +188,18 @@ async def competitor_deep_dive(competitor_name: str, location: str, router) -> d
     prompt = (f"Based on the research below about competitor '{competitor_name}', "
               f"return strict JSON: {{\"strengths\":[],\"weaknesses\":[],\"how_to_beat\":[]}}.\n\n"
               + "\n".join(bundle)[:12000])
-    try:
-        raw = await router.simple_gemini(prompt)
-    except Exception:
-        raw = await router.simple_deepseek(prompt)
+    raw = ""
+    for _call in (
+        lambda: router.simple_gemini(prompt),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            raw = await _call()
+            if raw:
+                break
+        except Exception:
+            pass
     try:
         s = raw.find("{"); e = raw.rfind("}")
         return json.loads(raw[s:e + 1])
@@ -194,10 +217,18 @@ async def estimate_campaign_budget(goal: str, location: str,
         "recommended budget, expected results, channel allocation percentages, "
         "and estimated CAC. Around 120 words."
     )
-    try:
-        return await router.simple_gemini(prompt) or ""
-    except Exception:
-        return await router.simple_deepseek(prompt) or ""
+    for _call in (
+        lambda: router.simple_gemini(prompt),
+        lambda: router.simple_deepseek(prompt),
+        lambda: router.simple_groq(prompt),
+    ):
+        try:
+            r = await _call()
+            if r:
+                return r
+        except Exception:
+            pass
+    return ""
 
 
 async def quick_search_summary(query: str, router) -> dict:
@@ -207,13 +238,18 @@ async def quick_search_summary(query: str, router) -> dict:
         return {"success": False, "result": "No results."}
     snippets = "\n".join(f"- {i.get('title','')}: {i.get('content','')[:300]}"
                          for i in items)
-    try:
-        summary = await router.simple_gemini(
-            f"Summarize this in 3 sentences as a briefing for a busy executive:\n{snippets}"
-        )
-    except Exception:
-        summary = await router.simple_deepseek(
-            f"Summarize this in 3 sentences as a briefing for a busy executive:\n{snippets}"
-        )
+    summary = ""
+    _prompt = f"Summarize this in 3 sentences as a briefing for a busy executive:\n{snippets}"
+    for _call in (
+        lambda: router.simple_gemini(_prompt),
+        lambda: router.simple_deepseek(_prompt),
+        lambda: router.simple_groq(_prompt),
+    ):
+        try:
+            summary = await _call()
+            if summary:
+                break
+        except Exception:
+            pass
     return {"success": True, "result": summary,
             "sources": [i.get("url") for i in items if i.get("url")]}
