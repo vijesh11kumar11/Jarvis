@@ -244,20 +244,25 @@ class AIRouter:
             async for tok in gen:
                 if tok and not tok.startswith("["):
                     produced = True
-                yield tok
+                    yield tok
+                # suppress error/bracket tokens — let fallback handle them silently
         except Exception as e:
-            yield f"[{primary} crashed: {e}]"
+            print(f"[ai_router] {primary} stream crashed: {e}")
 
         if produced:
             return
-        # Fallback chain
-        for fb in ["gemini", "groq", "deepseek"]:
+        # Fallback chain: gemini → deepseek → groq
+        for fb in ["gemini", "deepseek", "groq"]:
             if fb == primary:
                 continue
             try:
+                fb_produced = False
                 async for tok in self._pick(fb, system_prompt, user_message, history):
-                    yield tok
-                return
+                    if tok and not tok.startswith("["):
+                        fb_produced = True
+                        yield tok
+                if fb_produced:
+                    return
             except Exception:
                 continue
         yield ("I'm having trouble connecting to my brain right now. "
