@@ -1,124 +1,192 @@
 """
 backend/services/github_repo.py
-Fetch a GitHub repo via REST API (no clone) and produce a marketing brief
-biased toward gatekeeper strategy. Uses DeepSeek for code reasoning.
+Fetch a public GitHub repo and produce a structured marketing/positioning brief.
 """
-import os
+from __future__ import annotations
 import re
+import json
 import base64
+import asyncio
+from typing import Optional
 import httpx
 
-GH_API = "https://api.github.com"
+
+GITHUB_RE = re.compile(r"github\.com[:/]+([\w.-]+)/([\w.-]+?)(?:\.git)?/?$",
+                       re.IGNORECASE)
 
 
-def parse_repo_url(url: str):
-    url = url.strip().rstrip("/")
-    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?$", url)
-    if m:
-        return m.group(1), m.group(2)
-    parts = url.split("/")
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return None, None
+def parse_repo_url(url: str) -> Optional[tuple[str, str]]:
+    if not url: return None
+    m = GITHUB_RE.search(url.strip())
+    if not m: return None
+    owner, name = m.group(1), m.group(2)
+    return owner, name.removesuffix(".git")
 
 
-def _headers():
-    h = {"Accept": "application/vnd.github+json",
-         "X-GitHub-Api-Version": "2022-11-28"}
-    tok = os.getenv("GITHUB_TOKEN")
-    if tok:
-        h["Authorization"] = f"Bearer {tok}"
-    return h
+async def _fetch_json(client: httpx.AsyncClient, url: str) -> dict:
+    try:
+        r = await client.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
 
 
-async def fetch_repo_brief(url: str) -> dict:
-    owner, repo = parse_repo_url(url)
-    if not owner or not repo:
-        return {"error": "Could not parse GitHub URL."}
-    async with httpx.AsyncClient(timeout=30.0, headers=_headers()) as cli:
-        meta = (await cli.get(f"{GH_API}/repos/{owner}/{repo}")).json()
-        if meta.get("message") and "Not Found" in meta["message"]:
-            return {"error": f"Repo not found: {owner}/{repo}"}
+async def _fetch_text(client: httpx.AsyncClient, url: str) -> str:
+    try:
+        r = await client.get(url, timeout=15)
+        if r.status_code == 200: return r.text
+    except Exception:
+        pass
+    return ""
+
+
+async def fetch_repo_data(owner: str, repo: str) -> dict:
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}"
+    headers = {"Accept": "application/vnd.github+json",
+               "User-Agent": "Friday-Marketing-Jarvis"}
+    async with httpx.AsyncClient(headers=headers) as client:
+        repo_info, langs, topics_resp, contents = await asyncio.gather(
+            _fetch_json(client, base),
+            _fetch_json(client, base + "/languages"),
+            _fetch_json(client, base + "/topics"),
+            _fetch_json(client, base + "/contents"),
+        )
         # README
-        readme_text = ""
-        try:
-            r = await cli.get(f"{GH_API}/repos/{owner}/{repo}/readme")
-            if r.status_code == 200:
-                j = r.json()
-                readme_text = base64.b64decode(j.get("content", "")).decode(
-                    "utf-8", errors="ignore")
-        except Exception:
-            pass
-        # Top-level tree
-        tree = []
-        try:
-            t = await cli.get(
-                f"{GH_API}/repos/{owner}/{repo}/git/trees/{meta.get('default_branch','main')}?recursive=0")
-            if t.status_code == 200:
-                tree = [n["path"] for n in t.json().get("tree", [])][:50]
-        except Exception:
-            pass
-        # A couple of key files
-        key_blobs = {}
-        for fname in ("package.json", "pyproject.toml", "requirements.txt",
-                      "Cargo.toml", "go.mod"):
+        readme = ""
+        rd = await _fetch_json(client, base + "/readme")
+        if rd.get("content"):
             try:
-                f = await cli.get(
-                    f"{GH_API}/repos/{owner}/{repo}/contents/{fname}")
-                if f.status_code == 200:
-                    j = f.json()
-                    key_blobs[fname] = base64.b64decode(
-                        j.get("content", "")).decode("utf-8", errors="ignore")[:4000]
+                readme = base64.b64decode(rd["content"]).decode("utf-8", errors="ignore")
             except Exception:
-                pass
+                readme = ""
+        # branch fallback for raw files
+        default_branch = (repo_info.get("default_branch") or "main")
+        package_json = await _fetch_text(client, f"{raw_base}/{default_branch}/package.json")
+        requirements = await _fetch_text(client, f"{raw_base}/{default_branch}/requirements.txt")
+
+    file_names = [c.get("name") for c in (contents if isinstance(contents, list) else []) if c.get("name")][:30]
     return {
-        "owner": owner,
-        "repo": repo,
-        "description": meta.get("description", ""),
-        "stars": meta.get("stargazers_count", 0),
-        "language": meta.get("language", ""),
-        "topics": meta.get("topics", []),
-        "homepage": meta.get("homepage", ""),
-        "readme": readme_text[:12000],
-        "tree": tree,
-        "key_files": key_blobs,
+        "owner": owner, "repo": repo,
+        "name": repo_info.get("name"),
+        "description": repo_info.get("description") or "",
+        "stars": repo_info.get("stargazers_count", 0),
+        "forks": repo_info.get("forks_count", 0),
+        "watchers": repo_info.get("subscribers_count", 0),
+        "open_issues": repo_info.get("open_issues_count", 0),
+        "homepage": repo_info.get("homepage") or "",
+        "license": (repo_info.get("license") or {}).get("name") or "",
+        "topics": (topics_resp.get("names") or repo_info.get("topics") or [])[:20],
+        "languages": list((langs or {}).keys())[:8],
+        "files_root": file_names,
+        "readme": readme[:18000],
+        "package_json": package_json[:6000],
+        "requirements_txt": requirements[:6000],
     }
 
 
-async def analyze_repo_for_marketing(url: str, router) -> dict:
-    brief = await fetch_repo_brief(url)
-    if brief.get("error"):
-        return brief
-    context = f"""REPO: {brief['owner']}/{brief['repo']} (★{brief['stars']}, {brief['language']})
-DESCRIPTION: {brief['description']}
-TOPICS: {', '.join(brief['topics'])}
-TOP-LEVEL FILES: {', '.join(brief['tree'][:30])}
+PROMPT = """You are Friday, {user_name}'s personal CMO. Produce a marketing
+positioning brief for this GitHub project.
 
-README (truncated):
-\"\"\"
-{brief['readme']}
-\"\"\"
+USER BUSINESS CONTEXT (their day job):
+{biz}
 
-KEY FILES:
-{chr(10).join(f"--- {k} ---{chr(10)}{v}" for k,v in brief['key_files'].items())}
+REPO DATA:
+- name: {name}
+- description: {desc}
+- stars: {stars}, forks: {forks}, issues: {issues}
+- topics: {topics}
+- languages: {langs}
+- root files: {files}
+
+README EXCERPT:
+{readme}
+
+DEPENDENCIES (if any):
+{deps}
+
+Return your analysis in EXACTLY this format:
+
+PITCH (10 words max): <headline>
+
+PROBLEM IT SOLVES: <1-2 sentences>
+
+ICP (ideal customer profile): <who would actually use/install this>
+
+POSITIONING (fill in the blanks):
+"For <audience> who <struggle>, <product> is a <category> that <key benefit>, unlike <alternative> which <weakness>."
+
+CHANNELS:
+1. <channel + why it fits this product>
+2. <channel + why>
+3. <channel + why>
+
+CONTENT ANGLE: <the storytelling hook that makes devs/users care>
+
+LAUNCH STRATEGY: <Show HN / ProductHunt / Twitter dev / niche subreddit etc + reasoning>
+
+GROWTH MOVE: <one specific tactic to 10x reach this month>
+
+NEXT FEATURE TO BUILD (marketing-led): <feature + why it would unlock distribution>
+
+7-DAY PLAN:
+- Day 1-2: <action>
+- Day 3-4: <action>
+- Day 5-7: <action>
+
+SPOKEN BRIEF: <80-word friend-style spoken summary ready for TTS, no headers>
 """
-    prompt = f"""You are FRIDAY, marketing CMO and friend.
-Analyse this GitHub repository for Mr Vijesh and respond in a warm, spoken
-tone (no markdown headings) covering exactly:
 
-1) ONE honest sentence on what this product really is.
-2) Who would pay for it tomorrow morning (target audience, sharp).
-3) The GATEKEEPER play that would make this unfair (name which of:
-   data / distribution / standard / integration / certification /
-   curation / co-creation / supply-constrained — and why).
-4) Three concrete launch moves (no budget talk).
-5) The ONE move for this week.
 
-{context}
-"""
+async def analyze_repo_for_marketing(url_or_owner_repo: str,
+                                     user_context: Optional[dict] = None,
+                                     user_name: str = "Mr Vijesh") -> dict:
+    parsed = parse_repo_url(url_or_owner_repo)
+    if not parsed and "/" in url_or_owner_repo:
+        owner, repo = url_or_owner_repo.strip().split("/", 1)
+    elif parsed:
+        owner, repo = parsed
+    else:
+        return {"error": "Could not parse GitHub URL or owner/repo."}
+
+    data = await fetch_repo_data(owner, repo)
+    if not data.get("name"):
+        return {"error": f"Repo {owner}/{repo} not found or private."}
+
+    from ..brain.ai_router import get_router
+    router = get_router()
+    deps = ""
+    if data.get("package_json"): deps += "package.json:\n" + data["package_json"][:1500]
+    if data.get("requirements_txt"): deps += "\nrequirements.txt:\n" + data["requirements_txt"][:1500]
+
+    prompt = PROMPT.format(
+        user_name=user_name,
+        biz=json.dumps(user_context or {}, default=str)[:1200],
+        name=data["name"], desc=data["description"],
+        stars=data["stars"], forks=data["forks"], issues=data["open_issues"],
+        topics=", ".join(data["topics"]) or "—",
+        langs=", ".join(data["languages"]) or "—",
+        files=", ".join(data["files_root"]) or "—",
+        readme=(data["readme"] or "(no README)")[:14000],
+        deps=deps or "—",
+    )
     try:
-        analysis = await router.simple_deepseek(prompt) if hasattr(
-            router, "simple_deepseek") else await router.simple_gemini(prompt)
-    except Exception as e:
-        analysis = f"[Repo analysis failed: {e}]"
-    return {"brief": brief, "analysis": analysis}
+        analysis = await router.simple_gemini(prompt, model="gemini-2.0-flash-exp")
+    except Exception:
+        analysis = await router.simple_deepseek(prompt)
+    spoken = ""
+    m = re.search(r"SPOKEN BRIEF:\s*(.+)", analysis, re.IGNORECASE | re.DOTALL)
+    if m: spoken = m.group(1).strip()[:800]
+    return {
+        "owner": owner, "repo": repo, "data": data,
+        "analysis": analysis, "spoken": spoken,
+    }
+
+
+# Backwards-compat
+async def fetch_repo_brief(url: str) -> dict:
+    parsed = parse_repo_url(url)
+    if not parsed: return {"error": "Bad URL"}
+    return await fetch_repo_data(*parsed)

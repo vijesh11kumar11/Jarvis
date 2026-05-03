@@ -1,158 +1,193 @@
-// electron/main.js — Electron main process
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage } = require('electron')
-const path = require('path')
-const { spawn } = require('child_process')
-const http = require('http')
+/* electron/main.js
+ * Frameless Electron shell with embedded Python backend.
+ * Forwards renderer IPC calls to the FastAPI backend on :8000.
+ */
+const { app, BrowserWindow, ipcMain } = require("electron");
+const path = require("path");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
+const FormData = require("form-data");
 
-const isDev = !app.isPackaged
-let mainWindow = null
-let tray = null
-let pyProc = null
-
-function startBackend() {
-  if (pyProc) return
-  const cwd = path.join(__dirname, '..')
-  const pythonExe = process.platform === 'win32' ? 'python' : 'python3'
-  pyProc = spawn(pythonExe, ['backend/main.py'], { cwd, env: process.env })
-  pyProc.stdout.on('data', d => {
-    const msg = d.toString()
-    process.stdout.write('[py] ' + msg)
-    if (mainWindow) mainWindow.webContents.send('python-log', msg)
-  })
-  pyProc.stderr.on('data', d => {
-    const msg = d.toString()
-    process.stderr.write('[py-err] ' + msg)
-    if (mainWindow) mainWindow.webContents.send('python-log', msg)
-  })
-  pyProc.on('close', code => {
-    console.log('[py] exited with code', code)
-    pyProc = null
-  })
-  // Poll backend until ready, then notify renderer
-  const start = Date.now()
-  const check = () => {
-    http.get('http://127.0.0.1:8000/health', r => {
-      if (r.statusCode === 200) {
-        if (mainWindow) mainWindow.webContents.send('python-ready', true)
-        return
-      }
-      if (Date.now() - start < 30000) setTimeout(check, 500)
-    }).on('error', () => {
-      if (Date.now() - start < 30000) setTimeout(check, 500)
-    })
-  }
-  setTimeout(check, 800)
-}
-
-function stopBackend() {
-  if (pyProc) {
-    try { pyProc.kill() } catch (e) {}
-    pyProc = null
-  }
-}
+const isDev = !app.isPackaged;
+const BACKEND_URL = "http://localhost:8000";
+let mainWindow = null;
+let pyProcess = null;
+let backendReady = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
-    minWidth: 960,
-    minHeight: 640,
     frame: false,
-    backgroundColor: '#000000',
-    show: false,
+    backgroundColor: "#04060d",
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
     },
-  })
+  });
 
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173')
+    mainWindow.loadURL("http://localhost:5173");
   } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
-  mainWindow.once('ready-to-show', () => mainWindow.show())
 
-  mainWindow.on('close', e => {
-    if (!app.isQuitting) {
-      e.preventDefault()
-      mainWindow.hide()
+  mainWindow.webContents.on("did-finish-load", () => {
+    if (backendReady) mainWindow.webContents.send("python-ready", true);
+  });
+}
+
+// ─────── Python backend lifecycle ───────
+function pickPython() {
+  // Prefer system python on Windows; fall back to "python3" elsewhere.
+  if (process.platform === "win32") return "python";
+  return "python3";
+}
+
+async function pingBackend() {
+  try {
+    const r = await fetch(`${BACKEND_URL}/health`);
+    return r.ok;
+  } catch { return false; }
+}
+
+async function startPython() {
+  // If a backend is already running, skip spawning.
+  if (await pingBackend()) {
+    backendReady = true;
+    if (mainWindow) mainWindow.webContents.send("python-ready", true);
+    return;
+  }
+
+  const py = pickPython();
+  const root = path.resolve(__dirname, "..");
+  const entry = path.join(root, "backend", "main.py");
+  if (!fs.existsSync(entry)) {
+    console.error("[electron] backend/main.py not found");
+    return;
+  }
+  pyProcess = spawn(py, [entry], { cwd: root, env: process.env });
+
+  pyProcess.stdout.on("data", (d) => {
+    const txt = d.toString();
+    process.stdout.write(`[py] ${txt}`);
+    if (mainWindow) mainWindow.webContents.send("python-log", txt);
+    if (!backendReady && /listening on http/.test(txt)) {
+      backendReady = true;
+      mainWindow?.webContents.send("python-ready", true);
     }
-  })
+  });
+  pyProcess.stderr.on("data", (d) => {
+    const txt = d.toString();
+    process.stderr.write(`[py-err] ${txt}`);
+    if (mainWindow) mainWindow.webContents.send("python-log", txt);
+  });
+  pyProcess.on("exit", (c) => console.log(`[py] exited with code ${c}`));
 }
 
-function createTray() {
-  const iconPath = path.join(__dirname, 'icon.png')
-  let img
-  try { img = nativeImage.createFromPath(iconPath) } catch { img = nativeImage.createEmpty() }
-  if (img.isEmpty()) img = nativeImage.createEmpty()
-  tray = new Tray(img)
-  tray.setToolTip('Marketing Jarvis')
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Show Jarvis', click: () => { if (mainWindow) mainWindow.show() } },
-    { label: 'Hide', click: () => { if (mainWindow) mainWindow.hide() } },
-    { type: 'separator' },
-    { label: 'Quit', click: () => { app.isQuitting = true; app.quit() } },
-  ]))
-  tray.on('click', () => mainWindow && (mainWindow.isVisible() ? mainWindow.hide() : mainWindow.show()))
+// ─────── IPC handlers ───────
+ipcMain.handle("window-control", async (_e, cmd) => {
+  if (!mainWindow) return;
+  if (cmd === "minimize") mainWindow.minimize();
+  else if (cmd === "maximize")
+    mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+  else if (cmd === "close") mainWindow.close();
+});
+
+ipcMain.handle("system-info", async () => {
+  return { platform: process.platform, arch: process.arch,
+           appVersion: app.getVersion(), backendReady };
+});
+
+async function postJson(path, body) {
+  const r = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return await r.json();
 }
 
-// IPC bridge
-function fetchJson(url, opts) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url)
-    const lib = u.protocol === 'https:' ? require('https') : http
-    const data = opts && opts.body ? opts.body : null
-    const req = lib.request({
-      hostname: u.hostname, port: u.port, path: u.pathname + u.search,
-      method: opts && opts.method || 'GET',
-      headers: { 'Content-Type': 'application/json', ...(opts && opts.headers || {}) },
-    }, r => {
-      let buf = ''
-      r.on('data', c => buf += c)
-      r.on('end', () => {
-        try { resolve(JSON.parse(buf)) } catch { resolve(buf) }
-      })
-    })
-    req.on('error', reject)
-    if (data) req.write(data)
-    req.end()
-  })
-}
-
-ipcMain.handle('chat', async (_e, payload) => fetchJson('http://127.0.0.1:8000/chat', {
-  method: 'POST', body: JSON.stringify(payload),
-}))
-ipcMain.handle('research', async (_e, payload) => fetchJson('http://127.0.0.1:8000/research', {
-  method: 'POST', body: JSON.stringify(payload),
-}))
-ipcMain.handle('computer-action', async (_e, payload) => fetchJson('http://127.0.0.1:8000/computer/execute', {
-  method: 'POST', body: JSON.stringify(payload),
-}))
-ipcMain.handle('system-info', async () => fetchJson('http://127.0.0.1:8000/system/info'))
-ipcMain.handle('window-control', async (_e, action) => {
-  if (!mainWindow) return
-  if (action === 'minimize') mainWindow.minimize()
-  if (action === 'close') mainWindow.hide()
-  if (action === 'maximize') {
-    if (mainWindow.isMaximized()) mainWindow.unmaximize()
-    else mainWindow.maximize()
+ipcMain.handle("chat", async (_e, payload) => {
+  // Buffer SSE → return final text (renderer can also call /chat directly for streaming)
+  const r = await fetch(`${BACKEND_URL}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await r.text();
+  let full = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    try {
+      const obj = JSON.parse(line.slice(5).trim());
+      if (obj.delta) full += obj.delta;
+    } catch {}
   }
-})
+  return { text: full };
+});
 
-app.whenReady().then(() => {
-  startBackend()
-  createWindow()
-  createTray()
-  globalShortcut.register('Control+Space', () => {
-    if (!mainWindow) return
-    if (mainWindow.isVisible()) mainWindow.focus()
-    else mainWindow.show()
-    mainWindow.webContents.send('wake-word-detected', { source: 'hotkey' })
-  })
-})
+ipcMain.handle("speak", async (_e, payload) => {
+  const r = await fetch(`${BACKEND_URL}/speak`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { base64: buf.toString("base64"), mime: "audio/mpeg" };
+});
 
-app.on('window-all-closed', e => { e.preventDefault() })
-app.on('before-quit', () => { app.isQuitting = true; stopBackend() })
-app.on('will-quit', () => { globalShortcut.unregisterAll() })
+ipcMain.handle("research", (_e, p) => postJson("/research", p));
+ipcMain.handle("execute-computer", (_e, p) => postJson("/computer/execute", p));
+ipcMain.handle("generate-ideas", (_e, p) => postJson("/ideas/generate", p));
+ipcMain.handle("evaluate-idea", (_e, p) => postJson("/ideas/evaluate", p));
+ipcMain.handle("save-daily-context", (_e, p) => postJson("/daily-context", p));
+ipcMain.handle("analyze-github", (_e, p) =>
+  postJson("/analyze/github", { url: p.url, user_id: p.userId || "anonymous" }));
+
+ipcMain.handle("analyze-document", async (_e, { fileBuffer, filename, userId }) => {
+  const fd = new FormData();
+  fd.append("file", Buffer.from(fileBuffer), { filename: filename || "doc" });
+  fd.append("user_id", userId || "anonymous");
+  const r = await fetch(`${BACKEND_URL}/analyze/document`, {
+    method: "POST", body: fd, headers: fd.getHeaders(),
+  });
+  return await r.json();
+});
+
+ipcMain.handle("get-news", async (_e, { kind, userId, query }) => {
+  if (kind === "morning") {
+    const r = await fetch(`${BACKEND_URL}/news/morning-brief/${userId || "anonymous"}`);
+    return await r.json();
+  }
+  if (kind === "market") {
+    const r = await fetch(`${BACKEND_URL}/news/market-pulse`); return await r.json();
+  }
+  if (kind === "industry") {
+    const r = await fetch(`${BACKEND_URL}/news/industry/${userId || "anonymous"}`);
+    return await r.json();
+  }
+  if (kind === "search") return postJson("/news/search", { query, user_id: userId });
+  const r = await fetch(`${BACKEND_URL}/news/today/${userId || "anonymous"}`);
+  return await r.json();
+});
+
+// ─────── App lifecycle ───────
+app.whenReady().then(async () => {
+  createWindow();
+  startPython();
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (pyProcess) try { pyProcess.kill(); } catch {}
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  if (pyProcess) try { pyProcess.kill(); } catch {}
+});

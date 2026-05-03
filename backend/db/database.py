@@ -103,11 +103,51 @@ CREATE TABLE IF NOT EXISTS attachments (
     content TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS personal_memories (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    category TEXT CHECK(category IN ('family','goal','preference','fear','dream','habit','relationship','milestone','project','health','finance','other')),
+    content TEXT NOT NULL,
+    importance INTEGER DEFAULT 5,
+    last_referenced TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS friend_profile (
+    user_id TEXT PRIMARY KEY,
+    favorite_topics TEXT,
+    inside_jokes TEXT,
+    triggers_to_avoid TEXT,
+    motivation_style TEXT,
+    communication_preferences TEXT,
+    energy_pattern TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS daily_context (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    date DATE,
+    mood TEXT,
+    energy_level INTEGER,
+    focus_area TEXT,
+    wins TEXT,
+    challenges TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
+
+# Migration: add current_mode column to users if missing.
+MIGRATIONS = [
+    "ALTER TABLE users ADD COLUMN current_mode TEXT DEFAULT 'friend'",
+]
 
 async def init_database():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            try:
+                await db.execute(stmt)
+            except Exception:
+                pass  # column already exists
         await db.commit()
 
 async def get_db():
@@ -360,3 +400,105 @@ async def get_recent_attachments(user_id: str, limit: int = 5) -> list:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+# ───────── PERSONAL MEMORIES (life facts) ─────────
+async def save_personal_memory(user_id: str, category: str, content: str,
+                               importance: int = 5) -> str:
+    mid = str(uuid.uuid4())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO personal_memories (id,user_id,category,content,importance,last_referenced) VALUES (?,?,?,?,?,?)",
+            (mid, user_id, category, content, importance, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+    return mid
+
+
+async def get_personal_memories(user_id: str, category: Optional[str] = None,
+                                limit: int = 50) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if category:
+            cur = await db.execute(
+                "SELECT * FROM personal_memories WHERE user_id = ? AND category = ? ORDER BY importance DESC, created_at DESC LIMIT ?",
+                (user_id, category, limit),
+            )
+        else:
+            cur = await db.execute(
+                "SELECT * FROM personal_memories WHERE user_id = ? ORDER BY importance DESC, created_at DESC LIMIT ?",
+                (user_id, limit),
+            )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def touch_memory(memory_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE personal_memories SET last_referenced = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), memory_id),
+        )
+        await db.commit()
+
+
+# ───────── FRIEND PROFILE ─────────
+async def get_friend_profile(user_id: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM friend_profile WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else {"user_id": user_id}
+
+
+async def update_friend_profile(user_id: str, **fields) -> dict:
+    existing = await get_friend_profile(user_id)
+    has = bool(existing.get("favorite_topics") or existing.get("motivation_style"))
+    async with aiosqlite.connect(DB_PATH) as db:
+        if has:
+            cols = ", ".join(f"{k} = ?" for k in fields.keys())
+            await db.execute(
+                f"UPDATE friend_profile SET {cols}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                (*fields.values(), user_id),
+            )
+        else:
+            keys = ["user_id"] + list(fields.keys())
+            placeholders = ",".join("?" * len(keys))
+            await db.execute(
+                f"INSERT INTO friend_profile ({','.join(keys)}) VALUES ({placeholders})",
+                (user_id, *fields.values()),
+            )
+        await db.commit()
+    return await get_friend_profile(user_id)
+
+
+# ───────── DAILY CONTEXT ─────────
+async def save_daily_context(user_id: str, mood: str = "", energy_level: int = 5,
+                             focus_area: str = "", wins: str = "",
+                             challenges: str = "") -> str:
+    today = datetime.utcnow().date().isoformat()
+    cid = str(uuid.uuid4())
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Replace today's context if it exists.
+        await db.execute(
+            "DELETE FROM daily_context WHERE user_id = ? AND date = ?",
+            (user_id, today),
+        )
+        await db.execute(
+            "INSERT INTO daily_context (id,user_id,date,mood,energy_level,focus_area,wins,challenges) VALUES (?,?,?,?,?,?,?,?)",
+            (cid, user_id, today, mood, energy_level, focus_area, wins, challenges),
+        )
+        await db.commit()
+    return cid
+
+
+async def get_todays_context(user_id: str) -> Optional[dict]:
+    today = datetime.utcnow().date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM daily_context WHERE user_id = ? AND date = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id, today),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None

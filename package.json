@@ -17,7 +17,9 @@
   },
   "dependencies": {
     "axios": "^1.7.7",
+    "form-data": "^4.0.5",
     "framer-motion": "^11.11.17",
+    "node-fetch": "^3.3.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.27.0",
@@ -38,8 +40,17 @@
   "build": {
     "appId": "com.marketingjarvis.app",
     "productName": "Marketing Jarvis",
-    "files": ["dist/**", "electron/**", "backend/**", "package.json"],
-    "win": { "target": "nsis" },
-    "mac": { "target": "dmg" }
+    "files": [
+      "dist/**",
+      "electron/**",
+      "backend/**",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    }
   }
 }

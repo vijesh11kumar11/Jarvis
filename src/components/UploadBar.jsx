@@ -1,114 +1,96 @@
-import React, { useRef, useState } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import {
-  uploadDocument, analyzeGithub, visionChat, fileToBase64,
-} from '../hooks/useJarvis.js'
-import { useJarvis } from '../context/JarvisContext.jsx'
+/* src/components/UploadBar.jsx
+ * Floating drop-zone for documents + GitHub URL.
+ * - Drag a file here, OR paste a GitHub URL — Friday analyzes and speaks back.
+ */
+import React, { useCallback, useState } from "react";
+import { motion } from "framer-motion";
+import { useJarvis } from "../context/JarvisContext.jsx";
+import { useJarvisAPI } from "../hooks/useJarvis.js";
 
-export default function UploadBar({ onResult }) {
-  const { profile } = useJarvis()
-  const [busy, setBusy] = useState('')
-  const [showRepo, setShowRepo] = useState(false)
-  const [repoUrl, setRepoUrl] = useState('')
-  const docRef = useRef(null)
-  const imgRef = useRef(null)
+const GH_RE = /github\.com\/[\w.-]+\/[\w.-]+/i;
 
-  const userId = profile.userId || 'local'
+export default function UploadBar({ onAnalysis }) {
+  const { profile } = useJarvis();
+  const api = useJarvisAPI({
+    userId: profile?.userId || "anonymous",
+    jarvisName: profile.jarvisName,
+    userName: profile.userName,
+  });
+  const [busy, setBusy] = useState(false);
+  const [hover, setHover] = useState(false);
+  const [pasted, setPasted] = useState("");
 
-  async function handleDoc(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setBusy('doc')
+  const handleFile = useCallback(async (file) => {
+    if (!file) return;
+    setBusy(true);
     try {
-      const r = await uploadDocument(file, userId)
-      onResult?.({
-        kind: 'document', name: file.name,
-        text: r.analysis || '(no analysis)',
-      })
-    } finally { setBusy(''); e.target.value = '' }
-  }
+      const result = await api.analyzeDocument(file);
+      onAnalysis?.(result);
+    } finally {
+      setBusy(false);
+    }
+  }, [api, onAnalysis]);
 
-  async function handleImg(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setBusy('img')
+  const handleUrl = useCallback(async (url) => {
+    if (!url) return;
+    setBusy(true);
     try {
-      const b64 = await fileToBase64(file)
-      const r = await visionChat({
-        user_id: userId,
-        jarvis_name: profile.jarvisName,
-        user_name: profile.userName,
-        image_b64: b64,
-        prompt: `Look at this image and react as my marketing CMO friend.`,
-      })
-      onResult?.({
-        kind: 'image', name: file.name,
-        text: r.answer || '(no analysis)',
-      })
-    } finally { setBusy(''); e.target.value = '' }
-  }
+      const result = await api.analyzeGithub(url);
+      onAnalysis?.({ ...result, spoken: result?.spoken });
+    } finally {
+      setBusy(false);
+      setPasted("");
+    }
+  }, [api, onAnalysis]);
 
-  async function handleRepo() {
-    if (!repoUrl.trim()) return
-    setBusy('repo')
-    try {
-      const r = await analyzeGithub({ user_id: userId, url: repoUrl.trim() })
-      if (r.error) {
-        onResult?.({ kind: 'github', name: repoUrl, text: r.error })
-      } else {
-        const b = r.brief || {}
-        onResult?.({
-          kind: 'github', name: `${b.owner}/${b.repo}`,
-          text: r.analysis || '(no analysis)',
-        })
-      }
-      setRepoUrl(''); setShowRepo(false)
-    } finally { setBusy('') }
-  }
+  const onDrop = (e) => {
+    e.preventDefault(); setHover(false);
+    const f = e.dataTransfer?.files?.[0];
+    if (f) handleFile(f);
+    else {
+      const txt = e.dataTransfer?.getData("text/plain") || "";
+      if (GH_RE.test(txt)) handleUrl(txt);
+    }
+  };
+
+  const onPaste = (e) => {
+    const txt = e.clipboardData?.getData("text") || "";
+    if (GH_RE.test(txt)) {
+      e.preventDefault();
+      setPasted(txt);
+      handleUrl(txt);
+    }
+  };
 
   return (
-    <div className="absolute bottom-4 right-6 flex gap-2 items-center titlebar-no-drag">
-      <input ref={docRef} type="file" hidden onChange={handleDoc}
-             accept=".pdf,.docx,.txt,.md,.json,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.toml,.csv" />
-      <input ref={imgRef} type="file" hidden accept="image/*" onChange={handleImg} />
-
-      <IconBtn label="Upload document" busy={busy === 'doc'}
-               onClick={() => docRef.current?.click()}>📄</IconBtn>
-      <IconBtn label="Send image" busy={busy === 'img'}
-               onClick={() => imgRef.current?.click()}>🖼</IconBtn>
-      <IconBtn label="Analyse GitHub repo" busy={busy === 'repo'}
-               onClick={() => setShowRepo(s => !s)}>🐙</IconBtn>
-
-      <AnimatePresence>
-        {showRepo && (
-          <motion.form
-            initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 10 }}
-            onSubmit={e => { e.preventDefault(); handleRepo() }}
-            className="absolute bottom-14 right-0 bg-black/90 border border-violet-500/40 rounded-md p-2 flex gap-2 w-[320px]">
-            <input autoFocus value={repoUrl}
-                   onChange={e => setRepoUrl(e.target.value)}
-                   placeholder="https://github.com/owner/repo"
-                   className="flex-1 bg-black/60 border border-violet-700/40 rounded px-2 py-1 text-sm text-violet-100 outline-none" />
-            <button type="submit"
-              className="px-2 py-1 text-sm rounded bg-violet-600/40 border border-violet-300/40 text-violet-100">
-              {busy === 'repo' ? '…' : 'Go'}
-            </button>
-          </motion.form>
-        )}
-      </AnimatePresence>
-    </div>
-  )
-}
-
-function IconBtn({ children, onClick, busy, label }) {
-  return (
-    <motion.button whileHover={{ scale: 1.1 }} whileTap={{ scale: 0.95 }}
-      title={label} onClick={onClick}
-      className={`w-11 h-11 rounded-full border flex items-center justify-center text-lg
-        ${busy ? 'bg-amber-500/30 border-amber-300/60 animate-pulse'
-               : 'bg-black/60 border-violet-500/40 text-violet-200 hover:bg-violet-700/20'}`}>
-      {children}
-    </motion.button>
-  )
+    <motion.label
+      onDragOver={(e) => { e.preventDefault(); setHover(true); }}
+      onDragLeave={() => setHover(false)}
+      onDrop={onDrop}
+      onPaste={onPaste}
+      tabIndex={0}
+      className={`flex flex-col items-center justify-center rounded-xl
+                  border-2 border-dashed cursor-pointer text-xs
+                  transition-colors backdrop-blur-md
+                  ${hover ? "bg-violet-500/20 border-violet-300" :
+                            "bg-black/40 border-white/15 hover:border-violet-400/60"}`}
+      style={{ width: 200, height: 110 }}
+      animate={{ scale: hover ? 1.03 : 1 }}
+    >
+      <input type="file"
+        accept=".pdf,.docx,.txt,.md,.csv,.json,.pptx,.png,.jpg,.jpeg,.webp"
+        className="hidden"
+        onChange={(e) => handleFile(e.target.files?.[0])} />
+      <div className="text-violet-200/90 text-center px-3">
+        {busy ? "Analyzing…" :
+          <>📎 Drop file or paste GitHub URL<br/>
+          <span className="opacity-60">Friday will read it & speak</span></>}
+      </div>
+      {pasted && (
+        <div className="text-[10px] mt-1 text-emerald-300 truncate w-full px-2">
+          {pasted}
+        </div>
+      )}
+    </motion.label>
+  );
 }

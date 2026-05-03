@@ -1,12 +1,39 @@
-const { contextBridge, ipcRenderer } = require('electron')
+/* electron/preload.js
+ * Bridges the renderer (React) and the main process for window control,
+ * native operations, and the Python backend.
+ */
+const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld('jarvis', {
-  chat: (data) => ipcRenderer.invoke('chat', data),
-  research: (data) => ipcRenderer.invoke('research', data),
-  executeComputer: (action) => ipcRenderer.invoke('computer-action', action),
-  getSystemInfo: () => ipcRenderer.invoke('system-info'),
-  windowControl: (action) => ipcRenderer.invoke('window-control', action),
-  onWakeWord: (cb) => ipcRenderer.on('wake-word-detected', (_e, data) => cb(data)),
-  onPythonReady: (cb) => ipcRenderer.on('python-ready', (_e, data) => cb(data)),
-  onPythonLog: (cb) => ipcRenderer.on('python-log', (_e, data) => cb(data)),
-})
+const invoke = (ch, ...args) => ipcRenderer.invoke(ch, ...args);
+const on = (ch, fn) => {
+  const wrapped = (_e, ...args) => fn(...args);
+  ipcRenderer.on(ch, wrapped);
+  return () => ipcRenderer.removeListener(ch, wrapped);
+};
+
+contextBridge.exposeInMainWorld("jarvis", {
+  // Window control
+  windowControl: (cmd) => invoke("window-control", cmd),
+
+  // System
+  getSystemInfo: () => invoke("system-info"),
+
+  // Backend wrappers
+  chat: (payload) => invoke("chat", payload),
+  speak: (text, voiceId) => invoke("speak", { text, voice_id: voiceId }),
+  research: (payload) => invoke("research", payload),
+  executeComputer: (payload) => invoke("execute-computer", payload),
+  analyzeDocument: (fileBuffer, filename, userId) =>
+    invoke("analyze-document", { fileBuffer, filename, userId }),
+  analyzeGithub: (url, userId) => invoke("analyze-github", { url, userId }),
+  generateIdeas: (payload) => invoke("generate-ideas", payload),
+  evaluateIdea: (payload) => invoke("evaluate-idea", payload),
+  getNews: (kind, userId, query) => invoke("get-news", { kind, userId, query }),
+  saveDailyContext: (payload) => invoke("save-daily-context", payload),
+
+  // Events
+  onWakeWord: (fn) => on("wake-word", fn),
+  onPythonReady: (fn) => on("python-ready", fn),
+  onPythonLog: (fn) => on("python-log", fn),
+  removeListener: (ch, fn) => ipcRenderer.removeListener(ch, fn),
+});

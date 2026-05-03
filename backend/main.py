@@ -1,9 +1,9 @@
 """
 backend/main.py
-Marketing Jarvis backend (FastAPI). Gemini + Groq only.
-Run:  python -m uvicorn backend.main:app --reload --port 8000
-Or:   python backend/main.py
+Marketing Jarvis (Friday) — voice-only friend backend.
+Run: python backend/main.py
 """
+from __future__ import annotations
 import os
 import json
 import asyncio
@@ -11,13 +11,12 @@ import tempfile
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Allow running both as `python backend/main.py` and as a module
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -25,11 +24,13 @@ from backend.db import database as db
 from backend.db import memory as mem
 from backend.brain.ai_router import get_router
 from backend.brain.marketing_brain import build_marketing_brain
+from backend.brain.idea_engine import IdeaEngine
 from backend.brain import computer_control as cc
 from backend.services import research as rs
 from backend.services import voice_pipeline as vp
 from backend.services import documents as doc_svc
 from backend.services import github_repo as gh_svc
+from backend.services import news_intel as news
 
 load_dotenv()
 DEFAULT_JARVIS_NAME = os.getenv("DEFAULT_JARVIS_NAME", "Friday")
@@ -37,20 +38,17 @@ DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Mr Vijesh")
 DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "Coimbatore, India")
 PORT = int(os.getenv("APP_PORT", "8000"))
 
-# Keep references to background listeners
-_clap_listener: Optional[vp.DoubleClapDetector] = None
-_wake_listener: Optional[vp.PorcupineListener] = None
-# Wake event subscribers (SSE)
+_clap_listener = None
+_wake_listener = None
 _wake_subscribers: List[asyncio.Queue] = []
+_pending_actions: dict[str, dict] = {}
 
 
 def _wake_event(source: str):
     payload = json.dumps({"source": source})
     for q in list(_wake_subscribers):
-        try:
-            q.put_nowait(payload)
-        except Exception:
-            pass
+        try: q.put_nowait(payload)
+        except Exception: pass
 
 
 @asynccontextmanager
@@ -59,22 +57,16 @@ async def lifespan(app: FastAPI):
     print(f"[jarvis] database ready at {os.getenv('DB_PATH')}")
     print(f"[jarvis] backend listening on http://localhost:{PORT}")
     yield
-    if _clap_listener:
-        _clap_listener.stop()
-    if _wake_listener:
-        _wake_listener.stop()
+    if _clap_listener: _clap_listener.stop()
+    if _wake_listener: _wake_listener.stop()
 
 
-app = FastAPI(title="Marketing Jarvis", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Friday — Marketing Jarvis", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
-# ═══════════════════════ Models ═══════════════════════
+# ═══ Models ═══
 class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     jarvis_name: str = "Friday"
@@ -82,8 +74,9 @@ class ChatRequest(BaseModel):
     message: str
     business_context: Optional[dict] = None
     conversation_id: Optional[str] = None
-    use_model: Optional[str] = None  # "gemini" | "groq" | "deepseek" | None=auto
+    use_model: Optional[str] = None
     attached_context: Optional[str] = None
+    mode: Optional[str] = None
 
 
 class SpeakRequest(BaseModel):
@@ -93,7 +86,7 @@ class SpeakRequest(BaseModel):
 
 class ResearchRequest(BaseModel):
     user_id: Optional[str] = None
-    query: str
+    query: str = ""
     location: str
     business_type: str
     product: str
@@ -146,53 +139,152 @@ class BusinessUpdate(BaseModel):
     what_failed: Optional[str] = None
 
 
-# ═══════════════════════ Routes ═══════════════════════
+class DailyContextUpdate(BaseModel):
+    user_id: str
+    mood: Optional[str] = ""
+    energy_level: Optional[int] = 5
+    focus_area: Optional[str] = ""
+    wins: Optional[str] = ""
+    challenges: Optional[str] = ""
+
+
+class FriendProfileUpdate(BaseModel):
+    user_id: str
+    favorite_topics: Optional[str] = None
+    inside_jokes: Optional[str] = None
+    triggers_to_avoid: Optional[str] = None
+    motivation_style: Optional[str] = None
+    communication_preferences: Optional[str] = None
+    energy_pattern: Optional[str] = None
+
+
+class MemorySave(BaseModel):
+    user_id: str
+    category: str
+    content: str
+    importance: int = 5
+
+
+class MemoryExtract(BaseModel):
+    user_id: str
+    user_message: str
+    assistant_message: str = ""
+
+
+class IdeaGenRequest(BaseModel):
+    user_id: Optional[str] = None
+    topic: str
+    mode: str = "viral"
+    count: int = 5
+
+
+class IdeaEvalRequest(BaseModel):
+    user_id: Optional[str] = None
+    idea: dict
+
+
+class IdeaRemixRequest(BaseModel):
+    user_id: Optional[str] = None
+    idea: dict
+    constraint: str
+
+
+class NewsSearchRequest(BaseModel):
+    user_id: Optional[str] = None
+    query: str
+
+
+class ConfirmActionRequest(BaseModel):
+    action_id: str
+    confirm: bool
+
+
+# ═══ Helpers ═══
+async def _full_context(user_id: str) -> dict:
+    biz = await db.get_business_context(user_id) if user_id != "anonymous" else None
+    biz = biz or {}
+    return {
+        "user": await db.get_user(user_id) if user_id != "anonymous" else {},
+        "business": biz,
+        "product": biz.get("product", ""),
+        "target_audience": biz.get("target_audience", ""),
+        "location": biz.get("location", DEFAULT_LOCATION),
+        "budget_range": biz.get("budget_range", ""),
+        "brand_voice": biz.get("brand_voice", ""),
+        "what_worked": biz.get("what_worked", ""),
+        "what_failed": biz.get("what_failed", ""),
+    }
+
+
+MODE_PHRASES = {
+    "advisor": ["be more direct", "advisor mode", "executive mode", "cut to it"],
+    "critic":  ["be more critical", "stress test", "tear it apart", "be brutal"],
+    "friend":  ["just help me", "talk like a friend", "friend mode", "be chill"],
+}
+
+
+def _detect_mode_switch(message: str) -> Optional[str]:
+    m = (message or "").lower()
+    for mode, triggers in MODE_PHRASES.items():
+        if any(t in m for t in triggers):
+            return mode
+    return None
+
+
+# ═══ Routes ═══
 @app.get("/health")
 async def health():
-    return {"ok": True, "gemini": bool(os.getenv("GEMINI_API_KEY")),
+    return {"ok": True,
+            "gemini": bool(os.getenv("GEMINI_API_KEY")),
             "groq": bool(os.getenv("GROQ_API_KEY")),
+            "deepseek": bool(os.getenv("DEEPSEEK_API_KEY")),
             "elevenlabs": bool(os.getenv("ELEVENLABS_API_KEY")),
             "tavily": bool(os.getenv("TAVILY_API_KEY")),
-            "porcupine": bool(os.getenv("PORCUPINE_ACCESS_KEY"))}
+            "newsapi": bool(os.getenv("NEWS_API_KEY"))}
 
 
-# ── CHAT (SSE streaming) ──
 @app.post("/chat")
 async def chat(req: ChatRequest):
     router = get_router()
-
-    # Ensure conversation exists
     user_id = req.user_id or "anonymous"
+
     if user_id != "anonymous" and not await db.get_user(user_id):
         await db.create_user(req.user_name, req.jarvis_name)
     conv_id = req.conversation_id
     if not conv_id and user_id != "anonymous":
         conv_id = await db.start_conversation(user_id)
 
+    new_mode = _detect_mode_switch(req.message)
+    user_record = await db.get_user(user_id) if user_id != "anonymous" else {}
+    current_mode = req.mode or (user_record or {}).get("current_mode") or "friend"
+    if new_mode and user_id != "anonymous":
+        try: await db.update_user(user_id, current_mode=new_mode)
+        except Exception: pass
+        current_mode = new_mode
+
     biz = req.business_context or (await db.get_business_context(user_id) if user_id != "anonymous" else None)
     research = await db.get_latest_research(user_id) if user_id != "anonymous" else None
-    memory = await mem.build_memory_context(user_id) if user_id != "anonymous" else ""
-
     me = await db.get_about_me(user_id) if user_id != "anonymous" else {}
-    about_me_text = "\n".join([
-        me.get("life_story", "") or "",
-        me.get("preferences", "") or "",
-        me.get("facts", "") or "",
-    ]).strip()
+    friend_ctx = await mem.build_friend_memory_context(user_id) if user_id != "anonymous" else ""
+
     sys_prompt = build_marketing_brain(
         jarvis_name=req.jarvis_name,
         user_name=req.user_name,
         business_context=biz,
         market_research=research,
         user_location=(biz or {}).get("location", DEFAULT_LOCATION),
-        memory_context=memory,
-        about_me=about_me_text,
+        memory_context="",
+        about_me=me,
         attached_context=req.attached_context or "",
+        friend_context=friend_ctx,
+        mode=current_mode,
     )
 
     history = await db.get_recent_messages(conv_id, 10) if conv_id else []
     if conv_id:
         await db.add_message(conv_id, "user", req.message)
+
+    user_msg = req.message
 
     async def streamer():
         full = []
@@ -205,41 +297,30 @@ async def chat(req: ChatRequest):
             if conv_id and text:
                 await db.add_message(conv_id, "assistant", text,
                                      model_used=req.use_model or "auto")
-            yield f"data: {json.dumps({'done': True, 'conversation_id': conv_id})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conv_id, 'mode': current_mode})}\n\n"
+            if user_id != "anonymous" and text:
+                asyncio.create_task(
+                    mem.extract_memories_from_conversation(user_id, user_msg, text))
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(streamer(), media_type="text/event-stream")
 
 
-# ── SPEAK (audio stream) ──
 @app.post("/speak")
 async def speak(req: SpeakRequest):
     async def gen():
         async for chunk in vp.speak_streaming(req.text, req.voice_id):
-            if chunk:
-                yield chunk
+            if chunk: yield chunk
     return StreamingResponse(gen(), media_type="audio/mpeg")
 
 
-# ── LISTEN (transcribe upload) ──
 @app.post("/listen")
 async def listen(audio: UploadFile = File(...)):
-    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(await audio.read())
-        path = f.name
-    try:
-        result = await vp.transcribe_audio(path)
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-    return result
+    raw = await audio.read()
+    return await vp.transcribe_audio(raw)
 
 
-# ── RESEARCH ──
 @app.post("/research")
 async def research_endpoint(req: ResearchRequest):
     router = get_router()
@@ -248,32 +329,36 @@ async def research_endpoint(req: ResearchRequest):
         business_type=req.business_type, router=router,
         user_id=req.user_id,
     )
-    return report.to_dict()
+    return report.to_dict() if hasattr(report, "to_dict") else report
 
 
 @app.get("/research/weekly/{user_id}")
 async def weekly(user_id: str, industry: str = "marketing"):
-    router = get_router()
-    return {"brief": await rs.get_weekly_market_brief(industry, router)}
+    return {"brief": await rs.get_weekly_market_brief(industry, get_router())}
 
 
-# ── COMPUTER ──
 @app.post("/computer/execute")
 async def computer_execute(req: ComputerRequest):
     router = get_router()
     if req.natural_command and not req.action:
         intent = await cc.parse_computer_command(req.natural_command, router)
-        action = intent.get("action")
-        params = intent.get("params", {})
+        action = intent.get("action"); params = intent.get("params", {})
         speak = intent.get("speak", "")
     else:
-        action = req.action
-        params = req.params or {}
-        speak = ""
+        action, params, speak = req.action, req.params or {}, ""
 
     if not action or action == "none":
         return {"success": False, "result": "No actionable command detected.",
                 "speak": speak}
+
+    if req.require_confirmation:
+        import uuid
+        aid = str(uuid.uuid4())
+        _pending_actions[aid] = {"action": action, "params": params,
+                                 "user_id": req.user_id, "speak": speak}
+        return {"requires_confirmation": True, "action_id": aid,
+                "action": action, "params": params,
+                "speak": speak or f"I'm about to {action}. Should I go ahead?"}
 
     result = await cc.execute(action, params, router=router)
     if req.user_id:
@@ -285,70 +370,117 @@ async def computer_execute(req: ComputerRequest):
     return result
 
 
+@app.post("/computer/confirm")
+async def computer_confirm(req: ConfirmActionRequest):
+    pending = _pending_actions.pop(req.action_id, None)
+    if not pending:
+        return {"success": False, "result": "Action expired or unknown."}
+    if not req.confirm:
+        return {"success": True, "result": "Cancelled.", "cancelled": True}
+    router = get_router()
+    result = await cc.execute(pending["action"], pending["params"], router=router)
+    if pending.get("user_id"):
+        await db.log_computer_action(pending["user_id"], pending["action"],
+                                     pending["params"],
+                                     result.get("success", False),
+                                     str(result.get("result", ""))[:1000])
+    return result
+
+
 @app.get("/system/info")
 async def system_info():
     return cc.get_system_info()
 
 
-# ── USER ──
 @app.post("/user")
 async def create_user(req: UserCreate):
-    user = await db.create_user(req.name, req.jarvis_name, req.email)
-    return user
+    return await db.create_user(req.name, req.jarvis_name, req.email)
 
 
 @app.get("/user/{user_id}")
 async def get_user(user_id: str):
     u = await db.get_user(user_id)
-    if not u:
-        raise HTTPException(404, "Not found")
-    biz = await db.get_business_context(user_id)
-    return {"user": u, "business": biz}
+    if not u: raise HTTPException(404, "Not found")
+    return {"user": u, "business": await db.get_business_context(user_id)}
 
 
 @app.post("/business")
 async def update_business(req: BusinessUpdate):
-    fields = {k: v for k, v in req.model_dump().items()
-              if k != "user_id" and v is not None}
+    fields = {k: v for k, v in req.model_dump().items() if k != "user_id" and v is not None}
     return await db.upsert_business_context(req.user_id, **fields)
 
 
-# ── MEMORY ──
 @app.post("/memory/save/{conversation_id}")
 async def save_memory(conversation_id: str, user_id: str):
-    router = get_router()
-    return {"summary": await mem.summarize_conversation(conversation_id, user_id, router)}
+    return {"summary": await mem.summarize_conversation(conversation_id, user_id)}
 
 
 @app.get("/memory/{user_id}")
 async def get_memory(user_id: str):
-    return {"context": await mem.build_memory_context(user_id)}
+    return {"context": await mem.build_friend_memory_context(user_id)}
 
 
-# ── WAKE WORD CONTROL ──
+@app.post("/memory/save-fact")
+async def save_fact(req: MemorySave):
+    mid = await db.save_personal_memory(req.user_id, req.category,
+                                        req.content, req.importance)
+    return {"id": mid}
+
+
+@app.get("/memory/list/{user_id}")
+async def list_memories(user_id: str, category: Optional[str] = None):
+    return {"memories": await db.get_personal_memories(user_id, category)}
+
+
+@app.post("/memory/extract")
+async def memory_extract(req: MemoryExtract):
+    saved = await mem.extract_memories_from_conversation(
+        req.user_id, req.user_message, req.assistant_message)
+    return {"saved": saved}
+
+
+@app.post("/daily-context")
+async def daily_context_save(req: DailyContextUpdate):
+    cid = await db.save_daily_context(req.user_id, req.mood or "",
+                                      req.energy_level or 5,
+                                      req.focus_area or "",
+                                      req.wins or "", req.challenges or "")
+    return {"id": cid}
+
+
+@app.get("/daily-context/{user_id}")
+async def daily_context_get(user_id: str):
+    return await db.get_todays_context(user_id) or {}
+
+
+@app.get("/friend-profile/{user_id}")
+async def friend_profile_get(user_id: str):
+    return await db.get_friend_profile(user_id)
+
+
+@app.post("/friend-profile/update")
+async def friend_profile_update(req: FriendProfileUpdate):
+    fields = {k: v for k, v in req.model_dump().items()
+              if k != "user_id" and v is not None}
+    return await db.update_friend_profile(req.user_id, **fields)
+
+
 @app.post("/wake-word/start")
-async def wake_start(keyword: str = "jarvis"):
+async def wake_start(keyword: str = "hey_jarvis"):
     global _wake_listener, _clap_listener
-    if _wake_listener:
-        _wake_listener.stop()
-    _wake_listener = vp.PorcupineListener(keyword,
-                                          lambda: _wake_event("porcupine"),
-                                          float(os.getenv("WAKE_SENSITIVITY", "0.7")))
-    _wake_listener.start()
-    if _clap_listener:
-        _clap_listener.stop()
-    _clap_listener = vp.DoubleClapDetector(lambda: _wake_event("clap"))
-    _clap_listener.start()
+    if _wake_listener: _wake_listener.stop()
+    if _clap_listener: _clap_listener.stop()
+    handles = vp.start_all_wake_listeners(lambda: _wake_event("any"), keyword)
+    _wake_listener = handles.get("voice_thread")
+    _clap_listener = handles.get("clap_thread")
     return {"started": True, "keyword": keyword}
 
 
 @app.post("/wake-word/stop")
 async def wake_stop():
     global _wake_listener, _clap_listener
-    if _wake_listener:
-        _wake_listener.stop(); _wake_listener = None
-    if _clap_listener:
-        _clap_listener.stop(); _clap_listener = None
+    if _wake_listener: _wake_listener.stop(); _wake_listener = None
+    if _clap_listener: _clap_listener.stop(); _clap_listener = None
     return {"stopped": True}
 
 
@@ -360,28 +492,28 @@ async def wake_events(request: Request):
     async def gen():
         try:
             while True:
-                if await request.is_disconnected():
-                    break
+                if await request.is_disconnected(): break
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=15)
                     yield f"data: {item}\n\n"
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
         finally:
-            try:
-                _wake_subscribers.remove(q)
-            except ValueError:
-                pass
+            try: _wake_subscribers.remove(q)
+            except ValueError: pass
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-# ── USAGE ──
+@app.post("/wake/spoken/start")
+async def wake_spoken_start(model: Optional[str] = None):
+    return await wake_start(model or os.getenv("WAKE_WORD_MODEL", "hey_jarvis"))
+
+
 @app.get("/usage/{user_id}")
 async def usage(user_id: str):
     return await db.get_usage_summary(user_id)
 
 
-# ── ABOUT-ME (life story memory) ──
 @app.get("/about-me/{user_id}")
 async def get_about_me(user_id: str):
     return await db.get_about_me(user_id)
@@ -395,45 +527,47 @@ async def save_about_me(req: AboutMeUpdate):
                                     facts=req.facts or "")
 
 
-# ── DOCUMENT UPLOAD + ANALYSIS ──
 @app.post("/upload/document")
-async def upload_document(user_id: str = "anonymous",
-                          file: UploadFile = File(...)):
-    suffix = os.path.splitext(file.filename or "doc.txt")[1] or ".txt"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(await file.read())
-        path = f.name
-    try:
-        text = doc_svc.extract_text(path)
-        router = get_router()
-        analysis = await doc_svc.analyze_for_marketing(text,
-                                                      file.filename or "doc",
-                                                      router)
-    finally:
-        try: os.remove(path)
-        except Exception: pass
-    if user_id and user_id != "anonymous":
+@app.post("/analyze/document")
+async def analyze_document(user_id: str = Form("anonymous"),
+                           file: UploadFile = File(...)):
+    file_bytes = await file.read()
+    ctx = await _full_context(user_id) if user_id != "anonymous" else {}
+    friend_ctx = await mem.build_friend_memory_context(user_id) if user_id != "anonymous" else ""
+    result = await doc_svc.analyze_document_for_marketing(
+        file_bytes, file.filename or "doc",
+        user_context=ctx, friend_context=friend_ctx,
+        user_name=DEFAULT_USER_NAME,
+    )
+    if user_id and user_id != "anonymous" and not result.get("error"):
         await db.save_attachment(user_id, "document",
                                  file.filename or "document",
-                                 analysis[:2000], text[:50000])
-    return {"name": file.filename, "chars": len(text), "analysis": analysis}
-
-
-# ── GITHUB REPO ANALYSIS ──
-@app.post("/analyze/github")
-async def analyze_github(req: GithubAnalyzeRequest):
-    router = get_router()
-    result = await gh_svc.analyze_repo_for_marketing(req.url, router)
-    if req.user_id and req.user_id != "anonymous" and not result.get("error"):
-        b = result.get("brief", {})
-        name = f"{b.get('owner','?')}/{b.get('repo','?')}"
-        await db.save_attachment(req.user_id, "github", name,
-                                 result.get("analysis", "")[:2000],
-                                 b.get("readme", "")[:50000])
+                                 (result.get("analysis") or "")[:2000],
+                                 (result.get("extract_preview") or "")[:50000])
     return result
 
 
-# ── VISION CHAT (image + prompt → marketing read) ──
+@app.post("/analyze/github")
+async def analyze_github(req: GithubAnalyzeRequest):
+    ctx = await _full_context(req.user_id or "anonymous")
+    result = await gh_svc.analyze_repo_for_marketing(req.url,
+                                                     user_context=ctx,
+                                                     user_name=DEFAULT_USER_NAME)
+    if req.user_id and req.user_id != "anonymous" and not result.get("error"):
+        d = result.get("data", {})
+        name = f"{d.get('owner','?')}/{d.get('repo','?')}"
+        await db.save_attachment(req.user_id, "github", name,
+                                 (result.get("analysis") or "")[:2000],
+                                 (d.get("readme") or "")[:50000])
+    return result
+
+
+@app.get("/analyze/github/cached/{user_id}")
+async def analyze_github_cached(user_id: str):
+    rows = await db.get_recent_attachments(user_id, 10)
+    return [r for r in rows if r.get("kind") == "github"]
+
+
 @app.post("/vision/chat")
 async def vision_chat(req: VisionChatRequest):
     router = get_router()
@@ -443,38 +577,66 @@ async def vision_chat(req: VisionChatRequest):
         jarvis_name=req.jarvis_name, user_name=req.user_name,
         business_context=biz, market_research=None,
         user_location=(biz or {}).get("location", DEFAULT_LOCATION),
-        memory_context="", about_me=(me or {}).get("life_story", ""),
+        memory_context="", about_me=me,
         attached_context="(User has attached an image. See vision output.)",
     )
     full_prompt = f"{sys_prompt}\n\nUSER MESSAGE: {req.prompt}"
     answer = await router.gemini_vision_call(req.image_b64, full_prompt)
     if req.user_id and req.user_id != "anonymous":
         await db.save_attachment(req.user_id, "image",
-                                 "image-upload",
-                                 answer[:2000], "")
+                                 "image-upload", answer[:2000], "")
     return {"answer": answer}
 
 
-# ── SPOKEN WAKE (openWakeWord) ──
-@app.post("/wake/spoken/start")
-async def wake_spoken_start(model: Optional[str] = None):
-    global _wake_listener, _clap_listener
-    name = model or os.getenv("WAKE_WORD_MODEL", "alexa")
-    sens = float(os.getenv("WAKE_SENSITIVITY", "0.55"))
-    if _wake_listener:
-        _wake_listener.stop()
-    if hasattr(vp, "OpenWakeWordListener"):
-        _wake_listener = vp.OpenWakeWordListener(
-            name, lambda: _wake_event("openwakeword"), sens)
-    else:
-        _wake_listener = vp.PorcupineListener(
-            name, lambda: _wake_event("porcupine"), sens)
-    _wake_listener.start()
-    if _clap_listener:
-        _clap_listener.stop()
-    _clap_listener = vp.DoubleClapDetector(lambda: _wake_event("clap"))
-    _clap_listener.start()
-    return {"started": True, "model": name}
+@app.get("/news/morning-brief/{user_id}")
+async def news_morning(user_id: str):
+    ctx = await _full_context(user_id)
+    user = (await db.get_user(user_id)) or {}
+    return await news.generate_morning_briefing(ctx, user.get("name", DEFAULT_USER_NAME))
+
+
+@app.get("/news/today/{user_id}")
+async def news_today(user_id: str):
+    return await news.get_marketing_news(await _full_context(user_id))
+
+
+@app.get("/news/market-pulse")
+async def news_market():
+    return await news.get_financial_snapshot()
+
+
+@app.get("/news/industry/{user_id}")
+async def news_industry(user_id: str):
+    return await news.get_industry_trends(await _full_context(user_id))
+
+
+@app.post("/news/search")
+async def news_search(req: NewsSearchRequest):
+    return await news.search_news_on_demand(
+        req.query, await _full_context(req.user_id or "anonymous"))
+
+
+@app.post("/ideas/generate")
+async def ideas_generate(req: IdeaGenRequest):
+    ctx = await _full_context(req.user_id or "anonymous")
+    friend_ctx = await mem.build_friend_memory_context(req.user_id) \
+        if req.user_id and req.user_id != "anonymous" else ""
+    engine = IdeaEngine(get_router())
+    ideas = await engine.generate_ideas(req.topic, ctx, friend_ctx,
+                                        req.mode, req.count)
+    return {"ideas": ideas, "topic": req.topic, "mode": req.mode}
+
+
+@app.post("/ideas/evaluate")
+async def ideas_evaluate(req: IdeaEvalRequest):
+    ctx = await _full_context(req.user_id or "anonymous")
+    return await IdeaEngine(get_router()).evaluate_idea(req.idea, ctx)
+
+
+@app.post("/ideas/remix")
+async def ideas_remix(req: IdeaRemixRequest):
+    ctx = await _full_context(req.user_id or "anonymous")
+    return await IdeaEngine(get_router()).remix_idea(req.idea, req.constraint, ctx)
 
 
 if __name__ == "__main__":

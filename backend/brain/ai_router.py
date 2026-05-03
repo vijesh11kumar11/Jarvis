@@ -123,26 +123,60 @@ class AIRouter:
         except Exception as e:
             yield f"[Gemini error: {e}]"
 
-    async def simple_gemini(self, prompt: str) -> str:
-        if not self.gemini:
+    async def simple_gemini(self, prompt: str, model: Optional[str] = None) -> str:
+        target = self.gemini
+        if model and model != getattr(self, 'GEMINI_MODEL', None):
+            try:
+                import google.generativeai as genai
+                target = genai.GenerativeModel(model)
+            except Exception:
+                target = self.gemini
+        if not target:
             return ""
         loop = asyncio.get_event_loop()
         try:
             resp = await loop.run_in_executor(
-                None, lambda: self.gemini.generate_content(prompt))
+                None, lambda: target.generate_content(prompt))
             return resp.text or ""
         except Exception as e:
             print(f"[ai_router] simple_gemini error: {e}")
             return ""
 
+    async def simple_groq(self, prompt: str, model: Optional[str] = None) -> str:
+        if not self.async_groq:
+            return ""
+        try:
+            resp = await self.async_groq.chat.completions.create(
+                model=model or self.GROQ_MODEL,
+                messages=[{"role":"user","content":prompt}],
+                max_tokens=512, temperature=0.4,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            print(f"[ai_router] simple_groq error: {e}")
+            return ""
+
     # ─────────── GEMINI vision ───────────
-    async def gemini_vision_call(self, image_b64: str, prompt: str) -> str:
+    async def gemini_vision_call(self, prompt_or_b64, image_or_prompt=None) -> str:
+        # Flexible signature: (prompt, image_bytes) OR (image_b64, prompt) [legacy]
+        if isinstance(prompt_or_b64, (bytes, bytearray)):
+            image_data, prompt = prompt_or_b64, image_or_prompt or ""
+        elif isinstance(image_or_prompt, (bytes, bytearray)):
+            prompt, image_data = prompt_or_b64, image_or_prompt
+        else:
+            # both str: assume (image_b64, prompt) legacy ordering
+            try:
+                image_data = base64.b64decode(prompt_or_b64)
+                prompt = image_or_prompt or ""
+            except Exception:
+                # fall back to (prompt, b64-as-str)
+                prompt = prompt_or_b64
+                image_data = base64.b64decode(image_or_prompt or "") if image_or_prompt else b""
         if not self.gemini_vision:
             return "Vision unavailable — Gemini key missing."
         try:
             from PIL import Image
-            data = base64.b64decode(image_b64)
-            img = Image.open(io.BytesIO(data))
+            img = Image.open(io.BytesIO(image_data))
             loop = asyncio.get_event_loop()
             resp = await loop.run_in_executor(
                 None,
