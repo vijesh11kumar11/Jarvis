@@ -103,21 +103,24 @@ export default function Onboarding({ onComplete }) {
 
           {step === 4 && (
             <Step title="Connect your AI keys" subtitle="Stored only on your device. Never shared.">
+              <div className="text-xs rounded-lg bg-blue-900/40 border border-blue-500/30 text-blue-200 px-3 py-2 mb-3">
+                🎙 Wake word: Double-clap or tap the orb — no Porcupine key needed. OpenWakeWord (free, offline) handles spoken wake word automatically.
+              </div>
               <KeyField label="Gemini API Key" value={profile.keys.gemini}
                 onChange={v => update({ keys: { ...profile.keys, gemini: v } })}
                 href="https://makersuite.google.com/app/apikey" required />
               <KeyField label="Groq API Key" value={profile.keys.groq}
                 onChange={v => update({ keys: { ...profile.keys, groq: v } })}
                 href="https://console.groq.com/keys" required />
+              <KeyField label="DeepSeek API Key" value={profile.keys.deepseek}
+                onChange={v => update({ keys: { ...profile.keys, deepseek: v } })}
+                href="https://platform.deepseek.com" />
               <KeyField label="ElevenLabs API Key" value={profile.keys.elevenlabs}
                 onChange={v => update({ keys: { ...profile.keys, elevenlabs: v } })}
                 href="https://elevenlabs.io/app/settings/api-keys" />
               <KeyField label="Tavily API Key" value={profile.keys.tavily}
                 onChange={v => update({ keys: { ...profile.keys, tavily: v } })}
                 href="https://app.tavily.com" />
-              <KeyField label="Porcupine Access Key" value={profile.keys.porcupine}
-                onChange={v => update({ keys: { ...profile.keys, porcupine: v } })}
-                href="https://console.picovoice.ai" />
               <p className="text-xs text-gray-500 mt-3">
                 Note: keys here are stored locally for reference. The backend reads keys from <code>backend/.env</code>.
               </p>
